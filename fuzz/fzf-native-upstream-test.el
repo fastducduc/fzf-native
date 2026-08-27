@@ -39,10 +39,17 @@
     (if (<= limit 0) 0 (% fzf-native-upstream--state limit))))
 
 (defconst fzf-native-upstream--pieces
-  ["a" "b" "c" "F" "K" "-" "_" "/" "." " " "\t"])
+  ["a" "b" "c" "F" "K" "-" "_" "/" "." " " "\t"
+   "" " " " " " " " " " " " " "​" "　"
+   "é" "É" "K" "Ⱥ" "ⱥ" "İ" "ı" "Σ" "σ" "ς" "ẞ" "ß"
+   "Å" "å" "Å" "Ａ" "ａ" "𐐀" "𐐨" "你" "好" "界"
+   "λ" "Λ" "ж" "Ж" "א" "ع" "가" "🚀" "👩🏽‍💻" "é"])
 
 (defconst fzf-native-upstream--literals
-  ["a" "b" "f" "F" "k" "K" "foo" "bar" "src" "main"])
+  ["a" "b" "f" "F" "k" "K" "foo" "bar" "src" "main" "é" "É"
+   "K" "Ⱥ" "ⱥ" "İ" "ı" "Σ" "σ" "ς" "ẞ" "ß" "Å" "å" "Å"
+   "Ａ" "ａ" "𐐀" "𐐨" "你" "好" "λ" "Λ" "ж" "Ж" "א"
+   "ع" "가" "🚀" "👩🏽‍💻" "é"])
 
 (defun fzf-native-upstream--candidate ()
   "Generate one candidate accepted by fzf's NUL-delimited input."
@@ -56,12 +63,12 @@
 
 (defun fzf-native-upstream--term ()
   "Generate one extended-search term."
-  (concat (aref ["" "" "'" "^"]
-                (fzf-native-upstream--random 4))
+  (concat (aref ["" "" "'" "^" "!"]
+                (fzf-native-upstream--random 5))
           (aref fzf-native-upstream--literals
                 (fzf-native-upstream--random
                  (length fzf-native-upstream--literals)))
-          ""))
+          (if (zerop (fzf-native-upstream--random 5)) "$" "")))
 
 (defun fzf-native-upstream--query ()
   "Generate a small extended-search query."
@@ -92,8 +99,8 @@
     (unwind-protect
         (with-temp-buffer
           (insert (mapconcat #'identity collection "\0") "\0")
-          (let ((coding-system-for-write 'no-conversion)
-                (coding-system-for-read 'no-conversion)
+          (let ((coding-system-for-write 'utf-8-unix)
+                (coding-system-for-read 'utf-8-unix)
                 (status (apply #'call-process-region
                                (point-min) (point-max) fzf nil output nil
                                args)))
@@ -103,8 +110,8 @@
             (butlast (split-string (buffer-string) "\0" nil))))
       (kill-buffer output))))
 
-(ert-deftest fzf-native-fuzz-upstream-ascii-match-set ()
-  "Compare randomized ASCII match multisets with a pinned fzf CLI."
+(ert-deftest fzf-native-fuzz-upstream-match-set ()
+  "Compare randomized Unicode match multisets with a pinned fzf CLI."
   (let* ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
          (expected-version (getenv "FZF_REFERENCE_VERSION"))
          (seed (fzf-native-upstream--env-integer
@@ -112,7 +119,9 @@
          (cases (fzf-native-upstream--env-integer
                  "FZF_NATIVE_UPSTREAM_CASES" 200))
          (fixed '("" "a" "A" "alpha" " foo" "foo " "foo.bar"
-                  "src/main.c" "src-test")))
+                  "src/main.c" "src-test" "CAFÉ" "café" "é" "Kelvin"
+                  "kelvin" "Ⱥ" "ⱥ" "你好世界" "你是" "λambda" "Жук"
+                  "א" "🚀 launch")))
     (skip-unless fzf)
     (when (and expected-version (not (string-empty-p expected-version)))
       (let ((actual (car (process-lines fzf "--version"))))

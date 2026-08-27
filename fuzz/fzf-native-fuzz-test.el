@@ -41,20 +41,39 @@
     (if (<= limit 0) 0 (% fzf-native-fuzz--state limit))))
 
 (defconst fzf-native-fuzz--candidate-pieces
-  ["a" "b" "c" "F" "K" "-" "_" "/" "." " " "\t"])
+  ["a" "b" "c" "F" "K" "-" "_" "/" "." " " "\t"
+   "" " " " " " " " " " " " " "​" "　"
+   "é" "É" "K" "Ⱥ" "ⱥ" "İ" "ı" "Σ" "σ" "ς" "ẞ" "ß"
+   "Å" "å" "Å" "Ａ" "ａ" "𐐀" "𐐨" "你" "好" "界"
+   "λ" "Λ" "ж" "Ж" "א" "ع" "가" "🚀" "🧑‍💻" "👩🏽‍💻"
+   "é" "\0"])
 
 (defconst fzf-native-fuzz--query-pieces
-  ["a" "b" "c" "f" "F" "k" "K" "foo" "bar"])
+  ["a" "b" "c" "f" "F" "k" "K" "foo" "bar" "é" "É" "K"
+   "Ⱥ" "ⱥ" "İ" "ı" "Σ" "σ" "ς" "ẞ" "ß" "Å" "å" "Å"
+   "Ａ" "ａ" "𐐀" "𐐨" "你" "好" "λ" "Λ" "ж" "Ж" "א"
+   "ع" "가" "🚀" "👩🏽‍💻"])
+
+(defun fzf-native-fuzz--unibyte-string ()
+  "Generate a short unibyte string, including invalid UTF-8 bytes."
+  (let ((bytes [0 1 9 32 65 97 127 128 138 191 192 224 233 245 254 255])
+        (count (fzf-native-fuzz--random 12))
+        result)
+    (dotimes (_ count)
+      (push (aref bytes (fzf-native-fuzz--random (length bytes))) result))
+    (apply #'unibyte-string (nreverse result))))
 
 (defun fzf-native-fuzz--candidate ()
-  "Generate one short ASCII candidate."
-  (let ((count (fzf-native-fuzz--random 12)) pieces)
-    (dotimes (_ count)
-      (push (aref fzf-native-fuzz--candidate-pieces
-                  (fzf-native-fuzz--random
-                   (length fzf-native-fuzz--candidate-pieces)))
-            pieces))
-    (apply #'concat (nreverse pieces))))
+  "Generate one valid multibyte or arbitrary unibyte candidate."
+  (if (zerop (fzf-native-fuzz--random 5))
+      (fzf-native-fuzz--unibyte-string)
+    (let ((count (fzf-native-fuzz--random 12)) pieces)
+      (dotimes (_ count)
+        (push (aref fzf-native-fuzz--candidate-pieces
+                    (fzf-native-fuzz--random
+                     (length fzf-native-fuzz--candidate-pieces)))
+              pieces))
+      (apply #'concat (nreverse pieces)))))
 
 (defun fzf-native-fuzz--literal ()
   "Generate a nonempty operator-free query literal."
@@ -68,10 +87,10 @@
 
 (defun fzf-native-fuzz--term ()
   "Generate one extended-search term."
-  (concat (aref ["" "" "'" "^"]
-                (fzf-native-fuzz--random 4))
+  (concat (aref ["" "" "'" "^" "!"]
+                (fzf-native-fuzz--random 5))
           (fzf-native-fuzz--literal)
-          ""))
+          (if (zerop (fzf-native-fuzz--random 5)) "$" "")))
 
 (defun fzf-native-fuzz--query ()
   "Generate a small extended-search query."
@@ -90,7 +109,7 @@
 (defun fzf-native-fuzz--keys (collection)
   "Return a sorted, property-free multiset for COLLECTION."
   (sort (mapcar (lambda (string)
-                  (substring-no-properties string))
+                  (prin1-to-string (substring-no-properties string)))
                 (append collection nil))
         #'string<))
 
@@ -102,10 +121,11 @@
              when (> (car (fzf-native-score candidate query)) 0)
              collect candidate)))
 
-(defun fzf-native-fuzz--score-all (collection query highlight)
-  "Score COLLECTION for QUERY with explicit HIGHLIGHT behavior."
-  (let ((fzf-native-filter-only-min-pool nil)
+(defun fzf-native-fuzz--score-all (collection query filter-only highlight)
+  "Score COLLECTION for QUERY with explicit FILTER-ONLY and HIGHLIGHT modes."
+  (let ((fzf-native-filter-only-min-pool (and filter-only 1))
         (fzf-native-filter-only-length nil)
+        (fzf-native-filter-only-logic 'or)
         (fzf-native-batch-highlight (and highlight t))
         (fzf-native-highlight-fn
          (and highlight #'fzf-native-default-highlight-fn)))
@@ -136,18 +156,23 @@
                  (list-full
                   (fzf-native-fuzz--keys
                    (fzf-native-fuzz--score-all
-                    (fzf-native-fuzz--copies collection) query nil)))
+                    (fzf-native-fuzz--copies collection) query nil nil)))
                  (vector-full
                   (fzf-native-fuzz--keys
                    (fzf-native-fuzz--score-all
                     (vconcat (fzf-native-fuzz--copies collection))
-                    query nil)))
+                    query nil nil)))
+                 (filter-only
+                  (fzf-native-fuzz--keys
+                   (fzf-native-fuzz--score-all
+                    (fzf-native-fuzz--copies collection) query t nil)))
                  (highlight-input (fzf-native-fuzz--copies collection))
                  (highlighted
                   (fzf-native-fuzz--score-all
-                   highlight-input query t)))
+                   highlight-input query nil t)))
             (should (equal scalar list-full))
             (should (equal list-full vector-full))
+            (should (equal list-full filter-only))
             (should (equal list-full
                            (fzf-native-fuzz--keys highlighted)))
             (dolist (candidate highlight-input)
