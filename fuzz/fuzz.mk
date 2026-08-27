@@ -26,7 +26,8 @@ fuzz-build:
 	mkdir -p $(BUILD_DIR)
 	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
-		-I. -o $(FUZZ_BINARY) fuzz/fzf-native-fuzz.c fzf.c fzf-additions.c
+		-I. -I$(UTF8PROC_DIR) -o $(FUZZ_BINARY) fuzz/fzf-native-fuzz.c \
+		fzf.c fzf-additions.c $(UTF8PROC_SRC)
 
 .PHONY: fuzz
 fuzz: fuzz-build
@@ -43,8 +44,9 @@ fuzz-replay-build:
 	mkdir -p $(BUILD_DIR)
 	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
 		-DFZF_FUZZ_STANDALONE -fsanitize=address,undefined \
-		-fno-omit-frame-pointer -I. -o $(FUZZ_REPLAY_BINARY) \
-		fuzz/fzf-native-fuzz.c fzf.c fzf-additions.c
+		-fno-omit-frame-pointer -I. -I$(UTF8PROC_DIR) \
+		-o $(FUZZ_REPLAY_BINARY) fuzz/fzf-native-fuzz.c fzf.c \
+		fzf-additions.c $(UTF8PROC_SRC)
 
 .PHONY: fuzz-replay
 fuzz-replay: fuzz-replay-build
