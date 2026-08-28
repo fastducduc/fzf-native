@@ -2,9 +2,19 @@ name: Build And Publish Binaries
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Commit binaries and bump the package version
+        required: false
+        default: false
+        type: boolean
   push:
-    branches: ["develop"]
-    paths: ["**.c", "**.h"]
+    branches: ["main"]
+    paths:
+      - "**.c"
+      - "**.h"
+      - "CMakeLists.txt"
+      - ".github/workflows/cmake-binaries.yaml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,7 +29,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact: ubuntu-x86_64
+          - os: macos-15
+            artifact: macos-arm64
+          - os: macos-15-intel
+            artifact: macos-x86_64
+          - os: windows-latest
+            artifact: windows-x86_64
 
     steps:
     - uses: actions/checkout@v4
@@ -34,10 +52,29 @@ jobs:
     - name: Build
       run: cmake --build ${{github.workspace}}/build --verbose --config ${{env.BUILD_TYPE}}
 
+    - uses: jcs090218/setup-emacs@master
+      with:
+        version: 30.2
+
+    - name: Smoke-load built module
+      shell: bash
+      run: |
+        emacs -Q --batch -L . -l fzf-native \
+          -f fzf-native-load-dyn \
+          --eval '(unless (> (car (fzf-native-score "abc" "ac")) 0) (error "native smoke score failed"))'
+
+    - name: Smoke interactive session ABI
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        emacs -Q --batch -L . -l fzf-native \
+          -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+          --eval '(ert-run-tests-batch-and-exit "^fzf-native-async-submit-snapshot-lifecycle-test$")'
+
     - name: Upload binaries
       uses: actions/upload-artifact@v4
       with:
-        name: bin-${{ matrix.os }}
+        name: bin-${{ matrix.artifact }}
         path: bin/
         if-no-files-found: error
         retention-days: 1
@@ -56,10 +93,16 @@ jobs:
       with:
         usesh: true
         prepare: |
-          pkg install -y cmake
+          pkg install -y cmake emacs-nox
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
           cmake --build build --verbose --config ${{env.BUILD_TYPE}}
+          emacs -Q --batch -L . -l fzf-native \
+            -f fzf-native-load-dyn \
+            --eval '(unless (> (car (fzf-native-score "abc" "ac")) 0) (error "native smoke score failed"))'
+          emacs -Q --batch -L . -l fzf-native \
+            -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+            --eval '(ert-run-tests-batch-and-exit "^fzf-native-async-submit-snapshot-lifecycle-test$")'
 
     - name: Upload binaries
       uses: actions/upload-artifact@v4
@@ -70,6 +113,7 @@ jobs:
         retention-days: 1
 
   commit:
+    if: github.event_name == 'push' || inputs.publish == true
     needs: [build, build-freebsd]
     runs-on: ubuntu-latest
     permissions:
@@ -89,14 +133,25 @@ jobs:
 
     - name: Stage binaries
       run: |
+        rm -rf bin
         mkdir -p bin
         cp -R bin-artifacts/. bin/
         rm -rf bin-artifacts
+        test -f bin/Linux/fzf-native-module.so
+        test -f bin/FreeBSD/fzf-native-module.so
+        test -f bin/Darwin/fzf-native-module.so
+        test -f bin/Darwin/arm64/fzf-native-module.so
+        test -f bin/Windows/Release/fzf-native-module.dll
 
     - name: Bump version
       id: bump
       run: |
         current=$(grep -E '^;; Version: ' fzf-native.el | sed -E 's/^;; Version: //')
+        eask_current=$(sed -n -E 's/^[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' Eask | head -1)
+        if [ -z "$current" ] || [ "$current" != "$eask_current" ]; then
+          echo "Version mismatch before bump: fzf-native.el=$current Eask=$eask_current" >&2
+          exit 1
+        fi
         major=$(echo "$current" | cut -d. -f1)
         minor=$(echo "$current" | cut -d. -f2)
         minor=$((minor + 1))
