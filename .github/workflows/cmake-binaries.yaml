@@ -52,7 +52,21 @@ jobs:
     - name: Build
       run: cmake --build ${{github.workspace}}/build --verbose --config ${{env.BUILD_TYPE}}
 
-    - uses: jcs090218/setup-emacs@master
+    # nix-emacs-ci's current Nixpkgs no longer evaluates x86_64 Darwin.
+    # Install Nix with an immutable action, then select the last locked
+    # nix-emacs-ci revision that provides Emacs 30.2 on both Darwin arches.
+    - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      if: runner.os != 'Windows'
+
+    - name: Install Emacs 30.2 on POSIX
+      if: runner.os != 'Windows'
+      shell: bash
+      run: >-
+        nix profile install --accept-flake-config
+        github:purcell/nix-emacs-ci/b12b5b31e40df750478c9fc68c1e81c91ed079ec#emacs-30-2
+
+    - uses: jcs090218/setup-emacs-windows@3ad415b5f6575fe0bb8218cb35c199a93b1fb833
+      if: runner.os == 'Windows'
       with:
         version: 30.2
 
