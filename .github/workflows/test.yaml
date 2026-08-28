@@ -71,3 +71,13 @@ jobs:
         run: cmake --build build --config Release
 
       - run: make test
+
+      - uses: actions/checkout@v4
+        with:
+          repository: fastducduc/fzfa
+          ref: 713900c7d3be7301519056cffd8131ad7b8e54ea
+          path: paired-fzfa
+
+      - name: Test the paired fzfa frontend
+        shell: bash
+        run: make -C paired-fzfa test FZF_NATIVE_DIR=..
