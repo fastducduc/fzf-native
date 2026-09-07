@@ -363,6 +363,10 @@ static size_t min64u(size_t a, size_t b) {
   return (a < b) ? a : b;
 }
 
+static size_t index_at(size_t index, size_t max, bool forward) {
+  return forward ? index : max - index - 1;
+}
+
 fzf_position_t *fzf_pos_array(size_t len) {
   if (len > SIZE_MAX / sizeof(uint32_t)) {
     fzf_mark_allocation_failure();
@@ -1030,9 +1034,9 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
   return score;
 }
 
-fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
-                                fzf_string_t *text, fzf_string_t *pattern,
-                                fzf_position_t *pos, fzf_slab_t *slab) {
+static fzf_result_t fzf_fuzzy_match_v1_impl(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
   if (M == 0) {
@@ -1042,11 +1046,12 @@ fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
     return (fzf_result_t){-1, -1, 0};
   }
 
-  int32_t pidx = 0;
-  int32_t sidx = -1;
-  int32_t eidx = -1;
-  for (size_t idx = 0; idx < N; idx++) {
-    char c = text->data[idx];
+  size_t pidx = 0;
+  size_t sidx = 0;
+  size_t eidx = 0;
+  bool started = false;
+  for (size_t step = 0; step < N; step++) {
+    char c = text->data[index_at(step, N, forward)];
     /* TODO(conni2461): Common pattern maybe a macro would be good here */
     if (!case_sensitive) {
       /* TODO(conni2461): He does some unicode stuff here, investigate */
@@ -1055,36 +1060,40 @@ fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
     if (normalize) {
       c = normalize_rune(c);
     }
-    if (c == pattern->data[pidx]) {
-      if (sidx < 0) {
-        sidx = (int32_t)idx;
+    if (c == pattern->data[index_at(pidx, M, forward)]) {
+      if (!started) {
+        sidx = step;
+        started = true;
       }
       pidx++;
       if (pidx == M) {
-        eidx = (int32_t)idx + 1;
+        eidx = step + 1;
         break;
       }
     }
   }
-  if (sidx >= 0 && eidx >= 0) {
-    size_t start = (size_t)sidx;
-    size_t end = (size_t)eidx;
-    pidx--;
-    for (size_t idx = end - 1; idx >= start; idx--) {
-      char c = text->data[idx];
+  if (started && eidx > 0) {
+    size_t remaining = M;
+    for (size_t step = eidx; step-- > sidx;) {
+      char c = text->data[index_at(step, N, forward)];
       if (!case_sensitive) {
         /* TODO(conni2461): He does some unicode stuff here, investigate */
         c = (char)tolower((uint8_t)c);
       }
-      if (c == pattern->data[pidx]) {
-        pidx--;
-        if (pidx < 0) {
-          start = idx;
+      if (normalize) {
+        c = normalize_rune(c);
+      }
+      if (c == pattern->data[index_at(remaining - 1, M, forward)]) {
+        remaining--;
+        if (remaining == 0) {
+          sidx = step;
           break;
         }
       }
     }
 
+    size_t start = forward ? sidx : N - eidx;
+    size_t end = forward ? eidx : N - sidx;
     int32_t score = calculate_score(case_sensitive, normalize, text, pattern,
                                     start, end, pos, slab);
     return (fzf_result_t){(int32_t)start, (int32_t)end, score};
@@ -1092,9 +1101,23 @@ fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
   return (fzf_result_t){-1, -1, 0};
 }
 
-fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
+fzf_result_t fzf_fuzzy_match_v1_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v1_impl(case_sensitive, normalize, forward, text,
+                                 pattern, pos, slab);
+}
+
+fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
                                 fzf_string_t *text, fzf_string_t *pattern,
                                 fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v1_impl(case_sensitive, normalize, true, text,
+                                 pattern, pos, slab);
+}
+
+static fzf_result_t fzf_fuzzy_match_v2_impl(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
   const score_scheme_config_t *config = score_scheme_config(slab);
@@ -1103,8 +1126,8 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
   }
   if (slab != NULL &&
       (N != 0 && M > SIZE_MAX / N ? true : N * M > slab->I16.cap)) {
-    return fzf_fuzzy_match_v1(case_sensitive, normalize, text, pattern, pos,
-                              slab);
+    return fzf_fuzzy_match_v1_impl(case_sensitive, normalize, forward, text,
+                                   pattern, pos, slab);
   }
 
   size_t idx;
@@ -1187,10 +1210,10 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
       int16_t score = ScoreMatch + bonus * BonusFirstCharMultiplier;
       h0_sub.data[off] = score;
       c0_sub.data[off] = 1;
-      if (M == 1 && (score > max_score)) {
+      if (M == 1 && (forward ? score > max_score : score >= max_score)) {
         max_score = score;
         max_score_pos = idx + off;
-        if (bonus >= BonusBoundary) {
+        if (forward && bonus >= BonusBoundary) {
           break;
         }
       }
@@ -1328,7 +1351,8 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
       c_sub.data[j] = consecutive;
       in_gap = s1 < s2;
       int16_t score = max16(max16(s1, s2), 0);
-      if (pidx == M - 1 && (score > max_score)) {
+      if (pidx == M - 1 &&
+          (forward ? score > max_score : score >= max_score)) {
         max_score = score;
         max_score_pos = col;
       }
@@ -1382,8 +1406,22 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
                         (int32_t)max_score};
 }
 
+fzf_result_t fzf_fuzzy_match_v2_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v2_impl(case_sensitive, normalize, forward, text,
+                                 pattern, pos, slab);
+}
+
+fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
+                                fzf_string_t *text, fzf_string_t *pattern,
+                                fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v2_impl(case_sensitive, normalize, true, text,
+                                 pattern, pos, slab);
+}
+
 static fzf_result_t fzf_exact_match_impl(
-    bool case_sensitive, bool normalize, bool boundary_check,
+    bool case_sensitive, bool normalize, bool forward, bool boundary_check,
     fzf_string_t *text, fzf_string_t *pattern, fzf_position_t *pos,
     fzf_slab_t *slab) {
   const size_t M = pattern->size;
@@ -1428,11 +1466,12 @@ static fzf_result_t fzf_exact_match_impl(
              (idx + 1 == N ||
               !char_class_is_word(
                   char_class_of(text->data[idx + 1], config))));
-        if (boundary_match && bonus > best_bonus) {
+        if (boundary_match &&
+            (bonus > best_bonus || (!forward && bonus == best_bonus))) {
           best_pos = (int32_t)idx;
           best_bonus = bonus;
         }
-        if (boundary_match && bonus >= BonusBoundary) {
+        if (boundary_match && forward && bonus >= BonusBoundary) {
           break;
         }
         idx -= pidx - 1;
@@ -1469,18 +1508,32 @@ static fzf_result_t fzf_exact_match_impl(
   return (fzf_result_t){-1, -1, 0};
 }
 
+fzf_result_t fzf_exact_match_naive_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_exact_match_impl(case_sensitive, normalize, forward, false, text,
+                              pattern, pos, slab);
+}
+
+fzf_result_t fzf_exact_match_boundary_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_exact_match_impl(case_sensitive, normalize, forward, true, text,
+                              pattern, pos, slab);
+}
+
 fzf_result_t fzf_exact_match_naive(bool case_sensitive, bool normalize,
                                    fzf_string_t *text, fzf_string_t *pattern,
                                    fzf_position_t *pos, fzf_slab_t *slab) {
-  return fzf_exact_match_impl(case_sensitive, normalize, false, text, pattern,
-                              pos, slab);
+  return fzf_exact_match_impl(case_sensitive, normalize, true, false, text,
+                              pattern, pos, slab);
 }
 
 fzf_result_t fzf_exact_match_boundary(
     bool case_sensitive, bool normalize, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
-  return fzf_exact_match_impl(case_sensitive, normalize, true, text, pattern,
-                              pos, slab);
+  return fzf_exact_match_impl(case_sensitive, normalize, true, true, text,
+                              pattern, pos, slab);
 }
 
 fzf_result_t fzf_prefix_match(bool case_sensitive, bool normalize,
@@ -1627,7 +1680,7 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
 /* UTF-8 aware matching algorithms */
 
 static fzf_result_t fzf_exact_match_utf8_impl(
-    bool case_sensitive, bool normalize, bool boundary_check,
+    bool case_sensitive, bool normalize, bool forward, bool boundary_check,
     fzf_string_t *text, fzf_string_t *pattern, fzf_position_t *pos,
     fzf_slab_t *slab) {
   const size_t M = pattern->size;
@@ -1717,11 +1770,12 @@ static fzf_result_t fzf_exact_match_utf8_impl(
                 char_class_of_codepoint(next_cp, config));
           }
         }
-        if (boundary_match && bonus > best_bonus) {
+        if (boundary_match &&
+            (bonus > best_bonus || (!forward && bonus == best_bonus))) {
           best_pos = (int32_t)match_start_byte;
           best_bonus = bonus;
         }
-        if (boundary_match && bonus >= BonusBoundary) {
+        if (boundary_match && forward && bonus >= BonusBoundary) {
           break;
         }
         // Reset for next potential match — advance by first matched char's byte length
@@ -1793,17 +1847,31 @@ static fzf_result_t fzf_exact_match_utf8_impl(
   return (fzf_result_t){-1, -1, 0};
 }
 
+fzf_result_t fzf_exact_match_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, forward, false,
+                                   text, pattern, pos, slab);
+}
+
+fzf_result_t fzf_exact_match_boundary_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, forward, true,
+                                   text, pattern, pos, slab);
+}
+
 fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
                                   fzf_string_t *text, fzf_string_t *pattern,
                                   fzf_position_t *pos, fzf_slab_t *slab) {
-  return fzf_exact_match_utf8_impl(case_sensitive, normalize, false, text,
-                                   pattern, pos, slab);
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, true, false,
+                                   text, pattern, pos, slab);
 }
 
 fzf_result_t fzf_exact_match_boundary_utf8(
     bool case_sensitive, bool normalize, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
-  return fzf_exact_match_utf8_impl(case_sensitive, normalize, true, text,
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, true, true, text,
                                    pattern, pos, slab);
 }
 
@@ -2066,115 +2134,153 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
                                 config->boundary_white};
 }
 
-fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
-                                     fzf_string_t *text, fzf_string_t *pattern,
-                                     fzf_position_t *pos, fzf_slab_t *slab) {
+static fzf_result_t fzf_fuzzy_match_v1_utf8_impl(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
-  
+
   if (M == 0) {
     return (fzf_result_t){0, 0, 0};
   }
-  
-  // Check if pattern exists in text using UTF-8 aware fuzzy index
+
   if (!normalize &&
       utf8_fuzzy_index(text, pattern->data, M, case_sensitive) < 0) {
     return (fzf_result_t){-1, -1, 0};
   }
-  
-  // Build byte-to-char mapping for position conversion
+
   utf8_char_map_t *char_map = utf8_build_char_map(
       text->data, N, slab ? &slab->UTF8 : NULL);
   if (!char_map) {
     fzf_mark_allocation_failure();
     return (fzf_result_t){-1, -1, 0};
   }
-  
-  // Forward scan to find the first occurrence of all pattern characters
-  int32_t sidx = -1;
-  int32_t eidx = -1;
-  size_t text_pos = 0;
-  size_t pattern_pos = 0;
-  
-  while (text_pos < N && pattern_pos < M) {
-    utf8proc_int32_t text_cp, pattern_cp;
-    
-    // Decode text character
-    utf8proc_ssize_t text_bytes = utf8_iterate_lossy(
-      (const utf8proc_uint8_t*)(text->data + text_pos),
-      N - text_pos, &text_cp);
-    
-    // Decode pattern character
-    utf8proc_ssize_t pattern_bytes = utf8_iterate_lossy(
-      (const utf8proc_uint8_t*)(pattern->data + pattern_pos),
-      M - pattern_pos, &pattern_cp);
-    
-    // Check if characters match
-    if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
-      if (sidx < 0) {
-        sidx = (int32_t)text_pos;
-      }
-      pattern_pos += pattern_bytes;
-      if (pattern_pos >= M) {
-        eidx = (int32_t)(text_pos + text_bytes);
-        break;
-      }
-    }
-    
-    text_pos += text_bytes;
-  }
-  
-  if (sidx >= 0 && eidx >= 0) {
-    // Backward scan to tighten the range
-    size_t start = (size_t)sidx;
-    size_t end = (size_t)eidx;
 
-    /* Find the shortest suffix of the forward-match range that still
-       contains the pattern.  The old code used an unsigned character index
-       and waited for it to become negative; it instead wrapped to SIZE_MAX,
-       leaving START at the first forward match.  Track byte boundaries so
-       completion is represented by pattern_pos == 0 without underflow. */
-    pattern_pos = M;
-    text_pos = end;
-    while (text_pos > start && pattern_pos > 0) {
+  size_t start = 0;
+  size_t end = 0;
+  bool matched = false;
+  if (forward) {
+    size_t text_pos = 0;
+    size_t pattern_pos = 0;
+    bool started = false;
+    while (text_pos < N && pattern_pos < M) {
       utf8proc_int32_t text_cp, pattern_cp;
-      size_t previous_text_pos =
-          utf8_lossy_previous_char(text->data, text_pos, &text_cp);
-      size_t previous_pattern_pos =
-          utf8_lossy_previous_char(pattern->data, pattern_pos, &pattern_cp);
-
-      text_pos = previous_text_pos;
+      utf8proc_ssize_t text_bytes = utf8_iterate_lossy(
+          (const utf8proc_uint8_t *)text->data + text_pos, N - text_pos,
+          &text_cp);
+      utf8proc_ssize_t pattern_bytes = utf8_iterate_lossy(
+          (const utf8proc_uint8_t *)pattern->data + pattern_pos,
+          M - pattern_pos, &pattern_cp);
       if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
-        pattern_pos = previous_pattern_pos;
-        if (pattern_pos == 0) start = text_pos;
+        if (!started) {
+          start = text_pos;
+          started = true;
+        }
+        pattern_pos += (size_t)pattern_bytes;
+        if (pattern_pos == M) {
+          end = text_pos + (size_t)text_bytes;
+          matched = true;
+          break;
+        }
+      }
+      text_pos += (size_t)text_bytes;
+    }
+    if (matched) {
+      size_t pattern_pos = M;
+      size_t text_pos = end;
+      while (text_pos > start && pattern_pos > 0) {
+        utf8proc_int32_t text_cp, pattern_cp;
+        size_t previous_text =
+            utf8_lossy_previous_char(text->data, text_pos, &text_cp);
+        size_t previous_pattern =
+            utf8_lossy_previous_char(pattern->data, pattern_pos, &pattern_cp);
+        text_pos = previous_text;
+        if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
+          pattern_pos = previous_pattern;
+          if (pattern_pos == 0) start = text_pos;
+        }
       }
     }
-    
-    int32_t score = calculate_score_utf8(case_sensitive, normalize, text,
-                                         pattern, start, end, pos, slab);
-    
-    // Convert byte positions to character positions
-    size_t char_start = utf8_byte_to_char(char_map, start);
-    size_t char_end = utf8_byte_to_char(char_map, end);
-    
-    // Convert position array to character positions if needed
-    if (pos && pos->size > 0) {
-      for (size_t i = 0; i < pos->size; i++) {
-        pos->data[i] = utf8_byte_to_char(char_map, pos->data[i]);
+  } else {
+    size_t text_pos = N;
+    size_t pattern_pos = M;
+    bool started = false;
+    while (text_pos > 0 && pattern_pos > 0) {
+      utf8proc_int32_t text_cp, pattern_cp;
+      size_t previous_text =
+          utf8_lossy_previous_char(text->data, text_pos, &text_cp);
+      size_t previous_pattern =
+          utf8_lossy_previous_char(pattern->data, pattern_pos, &pattern_cp);
+      if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
+        if (!started) {
+          end = text_pos;
+          started = true;
+        }
+        pattern_pos = previous_pattern;
+        if (pattern_pos == 0) {
+          start = previous_text;
+          matched = true;
+          break;
+        }
+      }
+      text_pos = previous_text;
+    }
+    if (matched) {
+      size_t text_pos = start;
+      size_t pattern_pos = 0;
+      while (text_pos < end && pattern_pos < M) {
+        utf8proc_int32_t text_cp, pattern_cp;
+        utf8proc_ssize_t text_bytes = utf8_iterate_lossy(
+            (const utf8proc_uint8_t *)text->data + text_pos, end - text_pos,
+            &text_cp);
+        utf8proc_ssize_t pattern_bytes = utf8_iterate_lossy(
+            (const utf8proc_uint8_t *)pattern->data + pattern_pos,
+            M - pattern_pos, &pattern_cp);
+        if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
+          pattern_pos += (size_t)pattern_bytes;
+          if (pattern_pos == M) {
+            end = text_pos + (size_t)text_bytes;
+            break;
+          }
+        }
+        text_pos += (size_t)text_bytes;
       }
     }
-    
-    utf8_free_char_map(char_map);
-    return (fzf_result_t){(int32_t)char_start, (int32_t)char_end, score};
   }
-  
+
+  if (!matched) {
+    utf8_free_char_map(char_map);
+    return (fzf_result_t){-1, -1, 0};
+  }
+  int32_t score = calculate_score_utf8(case_sensitive, normalize, text,
+                                       pattern, start, end, pos, slab);
+  size_t char_start = utf8_byte_to_char(char_map, start);
+  size_t char_end = utf8_byte_to_char(char_map, end);
+  if (pos) {
+    for (size_t i = 0; i < pos->size; i++)
+      pos->data[i] = utf8_byte_to_char(char_map, pos->data[i]);
+  }
   utf8_free_char_map(char_map);
-  return (fzf_result_t){-1, -1, 0};
+  return (fzf_result_t){(int32_t)char_start, (int32_t)char_end, score};
 }
 
-fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
-                                     fzf_string_t *text, fzf_string_t *pattern,
-                                     fzf_position_t *pos, fzf_slab_t *slab) {
+fzf_result_t fzf_fuzzy_match_v1_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v1_utf8_impl(case_sensitive, normalize, forward,
+                                      text, pattern, pos, slab);
+}
+
+fzf_result_t fzf_fuzzy_match_v1_utf8(
+    bool case_sensitive, bool normalize, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v1_utf8_impl(case_sensitive, normalize, true, text,
+                                      pattern, pos, slab);
+}
+
+static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
   const score_scheme_config_t *config = score_scheme_config(slab);
@@ -2216,8 +2322,8 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   if (slab != NULL &&
       (Nc != 0 && Mc > SIZE_MAX / Nc ? true : Nc * Mc > slab->I16.cap)) {
     utf8_free_char_map(char_map);
-    return fzf_fuzzy_match_v1_utf8(case_sensitive, normalize, text, pattern,
-                                   pos, slab);
+    return fzf_fuzzy_match_v1_utf8_impl(case_sensitive, normalize, forward,
+                                        text, pattern, pos, slab);
   }
 
   // Start one character before the first match, just as ascii_fuzzy_index
@@ -2344,10 +2450,10 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
       int16_t score = ScoreMatch + bonus * BonusFirstCharMultiplier;
       h0_sub.data[off] = score;
       c0_sub.data[off] = 1;
-      if (Mc == 1 && (score > max_score)) {
+      if (Mc == 1 && (forward ? score > max_score : score >= max_score)) {
         max_score = score;
         max_score_pos = idx + off;
-        if (bonus >= BonusBoundary) {
+        if (forward && bonus >= BonusBoundary) {
           break;
         }
       }
@@ -2498,7 +2604,8 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
       c_sub.data[j] = consecutive;
       in_gap = s1 < s2;
       int16_t score = max16(max16(s1, s2), 0);
-      if (pidx == Mc - 1 && (score > max_score)) {
+      if (pidx == Mc - 1 &&
+          (forward ? score > max_score : score >= max_score)) {
         max_score = score;
         max_score_pos = col;
       }
@@ -2555,6 +2662,20 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
 
   return (fzf_result_t){(int32_t)j, (int32_t)max_score_pos + 1,
                         (int32_t)max_score};
+}
+
+fzf_result_t fzf_fuzzy_match_v2_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v2_utf8_impl(case_sensitive, normalize, forward,
+                                      text, pattern, pos, slab);
+}
+
+fzf_result_t fzf_fuzzy_match_v2_utf8(
+    bool case_sensitive, bool normalize, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v2_utf8_impl(case_sensitive, normalize, true, text,
+                                      pattern, pos, slab);
 }
 
 static bool append_set(fzf_term_set_t *set, fzf_term_t value) {
