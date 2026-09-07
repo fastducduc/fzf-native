@@ -471,23 +471,113 @@ static struct Str copy_emacs_string(emacs_env *env, struct Bump **bump,
   return s;
 }
 
+typedef struct {
+  uint16_t score;
+  uint16_t first;
+  uint16_t second;
+} FzfRankKeys;
+
+static bool fzf_rank_is_space(utf8proc_int32_t codepoint) {
+  return (codepoint >= 0x09 && codepoint <= 0x0d) ||
+         codepoint == 0x20 || codepoint == 0x85 || codepoint == 0xa0 ||
+         codepoint == 0x1680 ||
+         (codepoint >= 0x2000 && codepoint <= 0x200a) ||
+         codepoint == 0x2028 || codepoint == 0x2029 ||
+         codepoint == 0x202f || codepoint == 0x205f ||
+         codepoint == 0x3000;
+}
+
+static uint16_t fzf_rank_u16(size_t value) {
+  return value > UINT16_MAX ? UINT16_MAX : (uint16_t)value;
+}
+
+static uint16_t fzf_rank_score(int64_t score) {
+  if (score <= 0) return 0;
+  return score > UINT16_MAX ? UINT16_MAX : (uint16_t)score;
+}
+
+static uint64_t fzf_rank_sort_key(FzfRankKeys rank) {
+  return ((uint64_t)(UINT16_MAX - rank.score) << 32) |
+         ((uint64_t)rank.first << 16) | (uint64_t)rank.second;
+}
+
+/* Build the non-score sort keys used by pinned fzf.  Default ranks by the
+   Unicode-trimmed character count.  Path ranks by the distance from the last
+   slash or backslash, then by that count.  History has no extra key. */
+static FzfRankKeys fzf_rank_keys(const char *text, size_t text_len,
+                                 const fzf_score_bounds_t *bounds,
+                                 fzf_score_scheme_t scheme) {
+  size_t offset = 0, rune_index = 0;
+  size_t first_nonspace = SIZE_MAX, last_nonspace = 0;
+  ptrdiff_t last_delimiter = -1;
+  while (offset < text_len) {
+    utf8proc_int32_t codepoint = 0;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)text + offset,
+        (utf8proc_ssize_t)(text_len - offset), &codepoint);
+    if (width <= 0) {
+      codepoint = (unsigned char)text[offset];
+      width = 1;
+    }
+    if (!fzf_rank_is_space(codepoint)) {
+      if (first_nonspace == SIZE_MAX) first_nonspace = rune_index;
+      last_nonspace = rune_index;
+    }
+    if (codepoint == '/' || codepoint == '\\')
+      last_delimiter = (ptrdiff_t)rune_index;
+    offset += (size_t)width;
+    rune_index++;
+  }
+
+  size_t trim_length = first_nonspace == SIZE_MAX
+                           ? 0 : last_nonspace - first_nonspace + 1;
+  FzfRankKeys keys = {0};
+  keys.score = fzf_rank_score(bounds ? bounds->raw_score : 0);
+  if (scheme == FZF_SCORE_SCHEME_DEFAULT) {
+    keys.first = fzf_rank_u16(trim_length);
+  } else if (scheme == FZF_SCORE_SCHEME_PATH) {
+    keys.first = UINT16_MAX;
+    if (bounds && bounds->valid && bounds->min_begin >= 0 &&
+        last_delimiter <= bounds->min_begin) {
+      size_t distance = (size_t)((ptrdiff_t)bounds->min_begin -
+                                 last_delimiter);
+      keys.first = fzf_rank_u16(distance);
+    }
+    keys.second = fzf_rank_u16(trim_length);
+  }
+  return keys;
+}
+
 struct Candidate {
   emacs_value value;
   struct Str s;
   int score;
+  FzfRankKeys rank;
+  size_t idx;
 };
 
+static int candidate_order(const struct Candidate *left,
+                           const struct Candidate *right) {
+  uint16_t left_score = left->rank.score;
+  uint16_t right_score = right->rank.score;
+  if (left_score != right_score) return left_score > right_score ? -1 : 1;
+  if (left->rank.first != right->rank.first)
+    return left->rank.first < right->rank.first ? -1 : 1;
+  if (left->rank.second != right->rank.second)
+    return left->rank.second < right->rank.second ? -1 : 1;
+  if (left->idx != right->idx) return left->idx < right->idx ? -1 : 1;
+  return 0;
+}
+
 static int cmp_candidate(const void *a, const void *b) {
-  // This way to get fzf sorted correctly with qsort.
-  return ((struct Candidate *) b)->score - ((struct Candidate *) a)->score;
-  /* return ((struct Candidate *) a)->score - ((struct Candidate *) b)->score; */
+  return candidate_order(a, b);
 }
 
 static void insertion_sort_candidates(struct Candidate *xs, size_t n) {
   for (size_t i = 1; i < n; i++) {
     struct Candidate candidate = xs[i];
     size_t j = i;
-    while (j > 0 && xs[j - 1].score < candidate.score) {
+    while (j > 0 && candidate_order(&xs[j - 1], &candidate) > 0) {
       xs[j] = xs[j - 1];
       j--;
     }
@@ -495,37 +585,35 @@ static void insertion_sort_candidates(struct Candidate *xs, size_t n) {
   }
 }
 
-/* Counting sort of xs[0..n-1] by score, descending.
-   O(n + max_score). Falls back to qsort if allocations fail.
-   The normal insertion/counting-sort paths are stable; the emergency qsort
-   fallback after an allocation failure may lose same-score input order.
-   Caller must ensure every xs[i].score >= 0; negative scores would
-   index count[] out of bounds (undefined behavior). */
+/* Stable radix sort of xs[0..n-1] by the packed fzf rank key.  The input is
+   in producer order, so an exact key tie already has the final index order.
+   Allocation failure uses the same total comparator through qsort. */
 static void counting_sort_candidates(struct Candidate *xs, size_t n) {
   if (n <= 1) return;
-  /* Avoid the counting-sort allocations for tiny inputs, but retain the
-     stable input-order tie-break promised by the large-input path. */
+  /* Avoid the radix scratch allocation for tiny inputs. */
   if (n < 64) { insertion_sort_candidates(xs, n); return; }
-  int max_score = 0;
-  for (size_t i = 0; i < n; i++)
-    if (xs[i].score > max_score) max_score = xs[i].score;
-
-  int *count = calloc((size_t)(max_score + 1), sizeof *count);
-  if (!count) { qsort(xs, n, sizeof *xs, cmp_candidate); return; }
-
-  for (size_t i = 0; i < n; i++) count[xs[i].score]++;
-
-  /* Convert counts to start positions for descending order. */
-  int pos = 0;
-  for (int s = max_score; s >= 0; s--) { int c = count[s]; count[s] = pos; pos += c; }
-
   struct Candidate *out = malloc(n * sizeof *out);
-  if (!out) { free(count); qsort(xs, n, sizeof *xs, cmp_candidate); return; }
+  if (!out) { qsort(xs, n, sizeof *xs, cmp_candidate); return; }
 
-  for (size_t i = 0; i < n; i++) out[count[xs[i].score]++] = xs[i];
-  memcpy(xs, out, n * sizeof *xs);
+  struct Candidate *src = xs, *dst = out;
+  for (unsigned pass = 0; pass < 6; pass++) {
+    size_t count[256] = {0};
+    unsigned shift = pass * 8;
+    for (size_t i = 0; i < n; i++)
+      count[(fzf_rank_sort_key(src[i].rank) >> shift) & 0xff]++;
+    size_t offset[256];
+    offset[0] = 0;
+    for (size_t i = 1; i < 256; i++)
+      offset[i] = offset[i - 1] + count[i - 1];
+    for (size_t i = 0; i < n; i++) {
+      size_t byte = (fzf_rank_sort_key(src[i].rank) >> shift) & 0xff;
+      dst[offset[byte]++] = src[i];
+    }
+    struct Candidate *swap = src;
+    src = dst;
+    dst = swap;
+  }
   free(out);
-  free(count);
 }
 
 struct Batch {
@@ -543,8 +631,8 @@ struct Shared {
   ssize_t remaining;
 #endif
   /* When true, workers call `fzf_has_match' (cheap boolean) instead of
-     `fzf_get_score' and assign score=1 to survivors.  Caller is expected
-     to skip the counting sort so input order is preserved. */
+     `fzf_get_score' and assign score=1 to survivors.  The caller skips
+     ranked sorting to keep input order. */
   bool filter_only;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   _Atomic bool allocation_failed;
@@ -649,11 +737,12 @@ static void *worker_routine(void *ptr) {
           break;
         }
         /* You can get the score/position for as many items as you want */
+        fzf_score_bounds_t bounds = {0};
         int score = filter_only
           ? (fzf_has_match_bytes_preclassified(
                  x.s.b, x.s.len, input_is_ascii, pattern, slab) ? 1 : 0)
-          : fzf_get_score_bytes_preclassified(
-                x.s.b, x.s.len, input_is_ascii, pattern, slab);
+          : fzf_get_score_with_bounds_bytes_preclassified(
+                x.s.b, x.s.len, input_is_ascii, pattern, slab, &bounds);
         if (fzf_allocation_failed()) {
           shared_set_allocation_failed(shared);
           break;
@@ -662,6 +751,9 @@ static void *worker_routine(void *ptr) {
           /* printf("Str: %s # = %d | i = %d, batch->len = %d, batch_idx = %zd\n", */
           /*        x.s.b, score, i, batch->len, batch_idx); */
           x.score = score;
+          if (!filter_only)
+            x.rank = fzf_rank_keys(
+                x.s.b, x.s.len, &bounds, shared->score_scheme);
           batch->xs[n++] = x;
         }
       }
@@ -1060,6 +1152,8 @@ emacs_value fzf_native_score_all(emacs_env *env,
     struct Candidate *x = batch->xs + batch->len++;
     x->value = value;
     x->s = s;
+    x->rank = (FzfRankKeys){0};
+    x->idx = (size_t)i;
   }
 
   if (!batches) {
@@ -1091,6 +1185,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
         env, "fzf-native: matcher could not allocate parsed query");
     goto err;
   }
+  bool sortable = !pattern->only_inv;
   struct Shared shared = {
     .pattern = pattern,
     .batches = batches,
@@ -1165,7 +1260,7 @@ err_join_threads:
      score=1 from `fzf_has_match' so the sort would be a no-op — and
      preserve input order so callers (e.g. fussy) can run their own
      ranking against a stable, subsumable candidate set. */
-  if (!filter_only_mode)
+  if (!filter_only_mode && sortable)
     counting_sort_candidates(xs, len);
 
   /* Resolve C-side highlight cap from fussy-fzf-native-highlight.  After
@@ -1771,7 +1866,12 @@ static size_t async_strip_ansi(char *s, size_t len) {
 }
 #endif
 
-typedef struct { char *str; int score; uint32_t idx; } ScoredStr;
+typedef struct {
+  char *str;
+  int score;
+  uint32_t idx;
+  FzfRankKeys rank;
+} ScoredStr;
 
 /* Reference-counted immutable index array.  Allocated once by the scoring
    thread on cache_insert, retained in O(1) (atomic refcount bump under the
@@ -5334,8 +5434,14 @@ fzf_native_async_generation(emacs_env *env, ptrdiff_t nargs,
 static int cmp_scored_desc(const void *a, const void *b) {
   const ScoredStr *left = a;
   const ScoredStr *right = b;
-  if (left->score != right->score)
-    return left->score > right->score ? -1 : 1;
+  uint16_t left_score = left->rank.score;
+  uint16_t right_score = right->rank.score;
+  if (left_score != right_score)
+    return left_score > right_score ? -1 : 1;
+  if (left->rank.first != right->rank.first)
+    return left->rank.first < right->rank.first ? -1 : 1;
+  if (left->rank.second != right->rank.second)
+    return left->rank.second < right->rank.second ? -1 : 1;
   if (left->idx != right->idx)
     return left->idx < right->idx ? -1 : 1;
   return 0;
@@ -5360,7 +5466,7 @@ static bool async_heap_sift_scored(ScoredStr *xs, size_t root, size_t end,
   }
 }
 
-/* Allocationless fallback for counting-sort scratch failure.  The root is
+/* Allocationless fallback for radix-sort scratch failure.  The root is
    the worst element under the public total order, so each extraction places
    that element at the end and leaves score-desc/index-ascending output. */
 static bool async_heap_sort_scored(ScoredStr *xs, size_t n,
@@ -5380,68 +5486,44 @@ static bool async_heap_sort_scored(ScoredStr *xs, size_t n,
   return !async_stop_requested(stop);
 }
 
-/* Counting sort of xs[0..n-1] by score, descending.
-   O(n + max_score). Falls back to abortable allocationless heapsort when
-   scratch allocation fails. */
+/* Stable radix sort of xs[0..n-1] by the packed fzf rank key.  Allocation
+   failure uses the same total order through the abortable heap fallback. */
 /* Return false when STOP was raised while sorting.  The ordinary test and
    batch APIs use the wrapper below with no stop flag. */
 static bool counting_sort_scored_abortable(ScoredStr *xs, size_t n,
                                             _Atomic bool *stop) {
   if (n <= 1) return !async_stop_requested(stop);
-  int max_score = 0;
-  for (size_t i = 0; i < n; i++) {
-    if ((i & 0x3FFF) == 0 && async_stop_requested(stop)) return false;
-    if (xs[i].score > max_score) max_score = xs[i].score;
-  }
-
-  int *count = calloc((size_t)(max_score + 1), sizeof *count);
-  if (!count) return async_heap_sort_scored(xs, n, stop);
-
-  for (size_t i = 0; i < n; i++) {
-    if ((i & 0x3FFF) == 0 && async_stop_requested(stop)) {
-      free(count);
-      return false;
-    }
-    count[xs[i].score]++;
-  }
-
-  /* Convert counts to start positions for descending order. */
-  int pos = 0;
-  for (int s = max_score; s >= 0; s--) {
-    if (((unsigned)s & 0x3FFF) == 0 && async_stop_requested(stop)) {
-      free(count);
-      return false;
-    }
-    int c = count[s];
-    count[s] = pos;
-    pos += c;
-  }
-
   ScoredStr *out = malloc(n * sizeof *out);
-  if (!out) {
-    free(count);
-    return async_heap_sort_scored(xs, n, stop);
-  }
+  if (!out) return async_heap_sort_scored(xs, n, stop);
 
-  for (size_t i = 0; i < n; i++) {
-    if ((i & 0x3FFF) == 0 && async_stop_requested(stop)) {
-      free(out);
-      free(count);
-      return false;
+  ScoredStr *src = xs, *dst = out;
+  for (unsigned pass = 0; pass < 6; pass++) {
+    size_t count[256] = {0};
+    size_t offset[256];
+    unsigned shift = pass * 8;
+    for (size_t i = 0; i < n; i++) {
+      if ((i & 0x3fff) == 0 && async_stop_requested(stop)) {
+        free(out);
+        return false;
+      }
+      count[(fzf_rank_sort_key(src[i].rank) >> shift) & 0xff]++;
     }
-    out[count[xs[i].score]++] = xs[i];
-  }
-  for (size_t base = 0; base < n; base += 16384) {
-    if (async_stop_requested(stop)) {
-      free(out);
-      free(count);
-      return false;
+    offset[0] = 0;
+    for (size_t i = 1; i < 256; i++)
+      offset[i] = offset[i - 1] + count[i - 1];
+    for (size_t i = 0; i < n; i++) {
+      if ((i & 0x3fff) == 0 && async_stop_requested(stop)) {
+        free(out);
+        return false;
+      }
+      size_t byte = (fzf_rank_sort_key(src[i].rank) >> shift) & 0xff;
+      dst[offset[byte]++] = src[i];
     }
-    size_t amount = MIN((size_t)16384, n - base);
-    memcpy(xs + base, out + base, amount * sizeof *xs);
+    ScoredStr *swap = src;
+    src = dst;
+    dst = swap;
   }
   free(out);
-  free(count);
   return !async_stop_requested(stop);
 }
 
@@ -5651,12 +5733,14 @@ static void async_score_batches(struct AsyncScoringShared *shared,
         aborted = true; break;
       }
       int sc;
+      fzf_score_bounds_t bounds = {0};
       if (!pattern) {
         sc = 1;                  /* empty filter: keep everything */
       } else if (filter_only) {
         sc = fzf_has_match(batch->xs[i].str, pattern, slab) ? 1 : 0;
       } else {
-        sc = fzf_get_score(batch->xs[i].str, pattern, slab);
+        sc = fzf_get_score_with_bounds(
+            batch->xs[i].str, pattern, slab, &bounds);
       }
       if (fzf_allocation_failed()) {
         atomic_store_explicit(&shared->allocation_failed, true,
@@ -5666,7 +5750,13 @@ static void async_score_batches(struct AsyncScoringShared *shared,
       }
       if (!pattern || sc > 0) {
         batch->xs[n]         = batch->xs[i];
-        batch->xs[n++].score = sc;
+        batch->xs[n].score = sc;
+        if (pattern && !filter_only) {
+          size_t text_len = strlen(batch->xs[n].str);
+          batch->xs[n].rank = fzf_rank_keys(
+              batch->xs[n].str, text_len, &bounds, shared->score_scheme);
+        }
+        n++;
       }
     }
     if (aborted) break;
@@ -6222,7 +6312,7 @@ static void *scoring_thread_fn(void *arg) {
       free(growth_top);
       continue;
     }
-    bool has_pattern = (pattern != NULL);
+    bool sortable = pattern && !pattern->only_inv;
     /* Materialize and score a bounded batch window at a time.  Positive-limit
        full-mode requests reduce every window to top-K, then merge it into a
        running top-K.  Filter-only requests retain the first K matches in
@@ -6230,7 +6320,7 @@ static void *scoring_thread_fn(void *arg) {
        tracked independently, so dense result sets no longer materialize one
        ScoredStr per match merely to discard the tail.  LIMIT 0 intentionally
        retains every result because the caller requested an unlimited result. */
-    bool bounded_full = limit > 0 && !filter_only_mode;
+    bool bounded_full = limit > 0 && !filter_only_mode && sortable;
     ScoredStr *flat = NULL;
     size_t flat_capacity = 0;
     size_t pos = 0;
@@ -6240,7 +6330,8 @@ static void *scoring_thread_fn(void *arg) {
     size_t merge_values_capacity = 0;
     size_t delta_matches = 0;
 
-    if (bounded_full && incremental_growth && growth_top_count) {
+    if (incremental_growth && growth_top_count &&
+        (bounded_full || !sortable)) {
       flat = growth_top;
       growth_top = NULL;
       flat_capacity = growth_top_count;
@@ -6412,7 +6503,7 @@ static void *scoring_thread_fn(void *arg) {
             pos += batch->len;
           }
         }
-      } else if (filter_only_mode) {
+      } else if (filter_only_mode || !sortable) {
         size_t keep = MIN(window_matches, limit - pos);
         if (keep && !async_scored_reserve(
                         &flat, &flat_capacity, pos + keep)) {
@@ -6551,7 +6642,7 @@ static void *scoring_thread_fn(void *arg) {
       async_membership_disable(&membership);
 
     size_t ranked_count = pos;
-    if (!bounded_full && incremental_growth && growth_top_count) {
+    if (!bounded_full && sortable && incremental_growth && growth_top_count) {
       if (!delta_matches) {
         free(flat);
         flat = growth_top;
@@ -6590,7 +6681,7 @@ static void *scoring_thread_fn(void *arg) {
     /* Unlimited full-mode sorts the complete set on an ordinary run, or all
        cached results plus delta matches on an incremental run.  Positive
        limits were already reduced by the per-window top-K merge above. */
-    if (has_pattern && !filter_only_mode && !bounded_full &&
+    if (sortable && !filter_only_mode && !bounded_full &&
         ranked_count > 1 &&
         !counting_sort_scored_abortable(
             flat, ranked_count, &s->score_abort)) {
@@ -6612,7 +6703,7 @@ static void *scoring_thread_fn(void *arg) {
        bounded by `emit' (normally the positive result limit), not pool size.
        Refinement membership, when it fits its independent byte cap, was
        collected from every match before this ranking step. */
-    if (filter_only_mode && has_pattern && flat && emit > 1) {
+    if (filter_only_mode && sortable && flat && emit > 1) {
       fzf_slab_t *rank_slab = fzf_make_default_slab();
       bool rank_allocation_failed = !rank_slab ||
           !fzf_slab_set_score_scheme(rank_slab, score_scheme);
@@ -6623,7 +6714,11 @@ static void *scoring_thread_fn(void *arg) {
           rank_aborted = true;
           break;
         }
-        flat[i].score = fzf_get_score(flat[i].str, pattern, rank_slab);
+        fzf_score_bounds_t bounds = {0};
+        flat[i].score = fzf_get_score_with_bounds(
+            flat[i].str, pattern, rank_slab, &bounds);
+        flat[i].rank = fzf_rank_keys(
+            flat[i].str, strlen(flat[i].str), &bounds, score_scheme);
         if (fzf_allocation_failed()) {
           rank_allocation_failed = true;
           break;
