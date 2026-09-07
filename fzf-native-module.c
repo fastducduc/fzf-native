@@ -507,6 +507,10 @@ static uint64_t fzf_rank_sort_key(FzfRankKeys rank) {
 static FzfRankKeys fzf_rank_keys(const char *text, size_t text_len,
                                  const fzf_score_bounds_t *bounds,
                                  fzf_score_scheme_t scheme) {
+  FzfRankKeys keys = {0};
+  keys.score = fzf_rank_score(bounds ? bounds->raw_score : 0);
+  if (scheme == FZF_SCORE_SCHEME_HISTORY) return keys;
+
   size_t offset = 0, rune_index = 0;
   size_t first_nonspace = SIZE_MAX, last_nonspace = 0;
   ptrdiff_t last_delimiter = -1;
@@ -531,8 +535,6 @@ static FzfRankKeys fzf_rank_keys(const char *text, size_t text_len,
 
   size_t trim_length = first_nonspace == SIZE_MAX
                            ? 0 : last_nonspace - first_nonspace + 1;
-  FzfRankKeys keys = {0};
-  keys.score = fzf_rank_score(bounds ? bounds->raw_score : 0);
   if (scheme == FZF_SCORE_SCHEME_DEFAULT) {
     keys.first = fzf_rank_u16(trim_length);
   } else if (scheme == FZF_SCORE_SCHEME_PATH) {
