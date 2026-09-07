@@ -192,6 +192,27 @@ Read at the start of every scoring call."
   :type 'boolean
   :group 'fzf-native)
 
+(defcustom fzf-native-normalize nil
+  "Whether to normalize Latin characters when matching.
+When non-nil, matching follows fzf's Latin normalization table.  For
+example, the query `cafe' can match `café'.
+
+The module reads this value for each matching or highlighting call.
+A value change creates a distinct asynchronous request and cache identity."
+  :type 'boolean
+  :group 'fzf-native)
+
+(defcustom fzf-native-search-direction 'forward
+  "Direction used to select among equally ranked match occurrences.
+`forward' selects the earlier occurrence.  `backward' selects the later
+occurrence, as fzf does for an end-oriented tiebreak criterion.
+
+The module reads this value for each matching or highlighting call.
+A value change creates a distinct asynchronous request and cache identity."
+  :type '(choice (const :tag "Forward" forward)
+                 (const :tag "Backward" backward))
+  :group 'fzf-native)
+
 (defcustom fzf-native-batch-highlight 25
   "Highlight cap for the synchronous (batch) scoring path.
 Read by `fzf-native-score' / `fzf-native-score-all' on every call.
