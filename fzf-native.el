@@ -211,7 +211,8 @@ matching for the `default' and `history' schemes.  This is fzf's behavior.
 `forward' selects the earlier occurrence.  `backward' selects the later one.
 
 The module reads this value for each matching or highlighting call.
-A value change creates a distinct asynchronous request and cache identity."
+A resolved direction change creates a distinct asynchronous request and cache
+identity."
   :type '(choice (const :tag "Match score scheme" auto)
                  (const :tag "Forward" forward)
                  (const :tag "Backward" backward))
