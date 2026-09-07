@@ -896,7 +896,6 @@ static void test_pinned_fzf_latin_normalization(void) {
   }
   fzf_free_slab(slab);
   fzf_free_pattern(accented);
-
   char uppercase_query[] = "Ā";
   fzf_pattern_t *uppercase = fzf_parse_pattern(
       CaseRespect, true, uppercase_query, true);
