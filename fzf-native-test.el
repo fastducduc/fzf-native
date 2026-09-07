@@ -162,6 +162,14 @@
         (should (equal (fzf-native-score-all candidates "λ$")
                        (cadr case)))))))
 
+(ert-deftest fzf-native-inverse-only-or-preserves-producer-order-test ()
+  "Inverse-only OR terms do not activate fzf ranking."
+  (let ((candidates '("longer" "x" "path/to/value")))
+    (dolist (scheme '(default path history))
+      (let ((fzf-native-score-scheme scheme))
+        (should (equal (fzf-native-score-all candidates "!z | !q")
+                       candidates))))))
+
 (ert-deftest fzf-native-score-scheme-invalid-value-test ()
   "An invalid scheme signals before batch or highlight work is published."
   (let ((fzf-native-score-scheme 'not-a-scheme)
@@ -1380,6 +1388,76 @@ for i in range(40): print(f\"b{i}\", flush=True)
                               handle request-id)))
               (should (equal (plist-get snapshot :candidates)
                              (cadr case))))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-inverse-only-or-preserves-order-test ()
+  "Full and filter-only session paths preserve inverse-only producer order."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle
+         (fzf-native-async-start
+          "printf '%s\\n' longer x path/to/value"))
+        (fzf-native-async-highlight nil)
+        (expected '("longer" "x" "path/to/value")))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (dolist (scheme '(default path history))
+            (dolist (filter-only-length '(nil 100))
+              (let* ((fzf-native-score-scheme scheme)
+                     (fzf-native-filter-only-min-pool nil)
+                     (fzf-native-filter-only-length filter-only-length)
+                     (request-id
+                      (fzf-native-async-submit handle "!z | !q" 0))
+                     (snapshot
+                      (fzf-native-test--wait-for-request handle request-id)))
+                (should
+                 (eq (plist-get snapshot :filter-only)
+                     (and filter-only-length t)))
+                (should (equal (plist-get snapshot :candidates)
+                               expected))))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-inverse-only-or-growth-preserves-order-test ()
+  "A growth retry appends inverse-only matches in producer order."
+  (skip-unless (and (fboundp 'fzf-native-async-submit)
+                    (executable-find "python3")))
+  (let* ((gate (make-temp-file "fzf-native-inverse-growth-"))
+         (command
+          (format "python3 -u -c 'import os, sys, time
+gate = sys.argv[1]
+print(\"longer\", flush=True)
+print(\"x\", flush=True)
+while os.path.exists(gate): time.sleep(0.01)
+print(\"path/to/value\", flush=True)
+' %s" (shell-quote-argument gate)))
+         (handle (fzf-native-async-start command))
+         (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((request-id
+                  (fzf-native-async-submit handle "!z | !q" 0))
+                 (first
+                  (fzf-native-test--wait-for-request handle request-id)))
+            (should (equal (plist-get first :candidates)
+                           '("longer" "x")))
+            (delete-file gate)
+            (let ((deadline (+ (float-time) 10.0))
+                  snapshot)
+              (while (and (< (float-time) deadline)
+                          (progn
+                            (setq snapshot
+                                  (fzf-native-async-snapshot
+                                   handle request-id))
+                            (not (and
+                                  (eq (plist-get snapshot :state) 'complete)
+                                  (= (plist-get snapshot :pool-generation) 3)
+                                  (not (plist-get snapshot :stale))))))
+                (sleep-for 0.01))
+              (should (equal (plist-get snapshot :candidates)
+                             '("longer" "x" "path/to/value"))))))
+      (when (file-exists-p gate) (delete-file gate))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-bounded-top-k-crosses-coordinator-window-test ()
