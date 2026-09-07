@@ -3355,6 +3355,8 @@ the bad byte."
     fzf-native-session-abi-handshake-test
     fzf-native-module-init-publication-is-reentry-safe-test
     fzf-native-score-scheme-public-batch-test
+    fzf-native-score-scheme-ranking-parity-test
+    fzf-native-inverse-only-or-preserves-producer-order-test
     fzf-native-score-scheme-invalid-value-test
     fzf-native-normalize-public-batch-test
     fzf-native-search-direction-public-batch-test
@@ -3371,6 +3373,9 @@ the bad byte."
     fzf-native-async-cache-positive-quote-refinement-test
     fzf-native-async-cache-invalid-utf8-prefix-rescans-test
     fzf-native-async-cache-separates-score-schemes-test
+    fzf-native-async-score-scheme-ranking-parity-test
+    fzf-native-async-inverse-only-or-preserves-order-test
+    fzf-native-async-inverse-only-or-growth-preserves-order-test
     fzf-native-async-cache-separates-normalization-test
     fzf-native-async-cache-separates-search-direction-test
     fzf-native-async-max-line-length-counts-characters-test
@@ -3387,6 +3392,9 @@ the bad byte."
 
 (defun fzf-native-test-run-artifact-smoke ()
   "Run the maintained release-module smoke suite and exit Emacs."
+  (dolist (test fzf-native-test--artifact-smoke-tests)
+    (unless (ert-test-boundp test)
+      (error "Artifact smoke test is not registered: %S" test)))
   (ert-run-tests-batch-and-exit
    (cons 'member fzf-native-test--artifact-smoke-tests)))
 
