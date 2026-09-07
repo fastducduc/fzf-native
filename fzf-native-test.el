@@ -179,6 +179,47 @@
     (should-error (fzf-native-highlight-one "src/fzf" "fzf"))
     (should-error (fzf-native-highlight-all (list "src/fzf") "fzf"))))
 
+(ert-deftest fzf-native-normalize-public-batch-test ()
+  "Batch scoring and highlighting apply fzf Latin normalization."
+  (let ((fzf-native-normalize nil))
+    (should (equal (fzf-native-score "café" "cafe") '(0))))
+  (let ((fzf-native-normalize t))
+    (should (> (car (fzf-native-score "café" "cafe")) 0))
+    (should (equal (fzf-native-score-all '("café" "tea") "cafe")
+                   '("café")))))
+
+(ert-deftest fzf-native-search-direction-public-batch-test ()
+  "The direction option selects earlier or later equal-score occurrences."
+  (let* ((fzf-native-search-direction 'forward)
+         (forward (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (fzf-native-search-direction 'backward)
+         (backward (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (faced-p
+          (lambda (string index)
+            (let ((face (get-text-property index 'face string)))
+              (or (eq face 'completions-common-part)
+                  (and (listp face)
+                       (memq 'completions-common-part face)))))))
+    (should (funcall faced-p forward 1))
+    (should-not (funcall faced-p forward 4))
+    (should-not (funcall faced-p backward 1))
+    (should (funcall faced-p backward 4))))
+
+(ert-deftest fzf-native-exact-boundary-public-batch-test ()
+  "A paired trailing quote requires exact word boundaries."
+  (let ((fzf-native-fuzzy t))
+    (should (equal (fzf-native-score-all
+                    '("xyz" "/xyz/" "xxyz" "xyzz") "'xyz'")
+                   '("xyz" "/xyz/")))))
+
+(ert-deftest fzf-native-search-direction-invalid-value-test ()
+  "An invalid direction signals before batch work is published."
+  (let ((fzf-native-search-direction 'sideways))
+    (should-error (fzf-native-score "-ab-ab-" "ab"))
+    (should-error (fzf-native-score-all '("-ab-ab-") "ab"))
+    (should-error (fzf-native-highlight-one "-ab-ab-" "ab"))
+    (should-error (fzf-native-highlight-all (list "-ab-ab-") "ab"))))
+
 (ert-deftest fzf-native-score-with-slab-test ()
   "Test slab can be reused."
   (let* ((slab (fzf-native-make-slab (* 100 1024) 2048))
@@ -1458,6 +1499,73 @@ print(\"path/to/value\", flush=True)
               (should (equal (plist-get snapshot :candidates)
                              '("longer" "x" "path/to/value"))))))
       (when (file-exists-p gate) (delete-file gate))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-separates-normalization-test ()
+  "Normalization is part of async request identity and result metadata."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' cafe 'café' tea"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((fzf-native-normalize nil)
+                 (plain-id (fzf-native-async-submit handle "cafe" 10))
+                 (plain (fzf-native-test--wait-for-request handle plain-id)))
+            (should-not (plist-get plain :normalize))
+            (should (equal (plist-get plain :candidates) '("cafe")))
+            (let ((fzf-native-normalize t))
+              (should-not (fzf-native-async-result-fresh-p handle "cafe"))
+              (let* ((normalized-id
+                      (fzf-native-async-submit handle "cafe" 10))
+                     (normalized
+                      (fzf-native-test--wait-for-request
+                       handle normalized-id)))
+                (should (> normalized-id plain-id))
+                (should (plist-get normalized :normalize))
+                (should (member "cafe" (plist-get normalized :candidates)))
+                (should (member "café" (plist-get normalized :candidates)))))
+            (let ((fzf-native-normalize nil))
+              (should (fzf-native-async-result-fresh-p handle "cafe")))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-separates-search-direction-test ()
+  "Direction is retained across async scoring, cache reuse, and highlighting."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' '-ab-ab-'"))
+        (fzf-native-async-highlight t))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((fzf-native-search-direction 'forward)
+                 (forward-id (fzf-native-async-submit handle "ab" 10))
+                 (forward
+                  (fzf-native-test--wait-for-request handle forward-id))
+                 (forward-candidate (car (plist-get forward :candidates))))
+            (should (eq (plist-get forward :search-direction) 'forward))
+            (should (get-text-property 1 'face forward-candidate))
+            (should-not (get-text-property 4 'face forward-candidate))
+            (let ((fzf-native-search-direction 'backward))
+              (should-not (fzf-native-async-result-fresh-p handle "ab"))
+              (let* ((backward-id (fzf-native-async-submit handle "ab" 10))
+                     (backward
+                      (fzf-native-test--wait-for-request handle backward-id))
+                     (backward-candidate
+                      (car (plist-get backward :candidates))))
+                (should (> backward-id forward-id))
+                (should (eq (plist-get backward :search-direction)
+                            'backward))
+                (should-not (get-text-property 1 'face backward-candidate))
+                (should (get-text-property 4 'face backward-candidate))))
+            (let* ((before (fzf-native-async-status handle))
+                   (before-id (plist-get before :latest-request-id))
+                   (fzf-native-search-direction 'sideways))
+              (should-error (fzf-native-async-submit handle "ab" 10))
+              (should-error (fzf-native-async-result-fresh-p handle "ab"))
+              (should (= (plist-get (fzf-native-async-status handle)
+                                    :latest-request-id)
+                         before-id)))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-bounded-top-k-crosses-coordinator-window-test ()

@@ -182,6 +182,7 @@ emacs_value Fsymbol_value;
    `defcustom_value' on each read.  The values themselves stay dynamic
    so user `setq' / `customize-set-variable' is respected. */
 emacs_value Qsym_score_scheme, Qsym_case_mode, Qsym_fuzzy;
+emacs_value Qsym_normalize, Qsym_search_direction;
 emacs_value Qsym_batch_highlight, Qsym_async_highlight;
 emacs_value Qsym_max_line_length, Qsym_async_cache_size;
 emacs_value Qsym_async_cache_bytes;
@@ -192,6 +193,7 @@ emacs_value Qsym_process_environment;
 emacs_value Qsym_highlight_fn;
 /* Cached value symbols for `type-of' comparisons and signal/error names. */
 emacs_value Qvector, Qstring, Qdefault, Qpath, Qhistory, Qignore, Qrespect;
+emacs_value Qforward, Qbackward;
 emacs_value Qor, Qand;
 emacs_value Qstringp, Qwrong_type_argument, Qerror;
 
@@ -1016,6 +1018,29 @@ static bool resolve_fzf_native_fuzzy(emacs_env *env) {
   return !env->eq(env, v, Qnil);
 }
 
+/* Read `fzf-native-normalize' once for each public request. */
+static bool resolve_fzf_native_normalize(emacs_env *env) {
+  emacs_value v = defcustom_value(env, Qsym_normalize, Qnil);
+  return !env->eq(env, v, Qnil);
+}
+
+/* Resolve `fzf-native-search-direction'.  Direction changes ranges and can
+   change scores, so an invalid value must not share a cache identity with a
+   silently selected fallback. */
+static bool resolve_fzf_native_forward(emacs_env *env, bool *out) {
+  emacs_value v = defcustom_value(env, Qsym_search_direction, Qforward);
+  if (env->eq(env, v, Qforward))
+    *out = true;
+  else if (env->eq(env, v, Qbackward))
+    *out = false;
+  else {
+    async_signal_error(
+        env, "fzf-native-search-direction must be forward or backward");
+    return false;
+  }
+  return true;
+}
+
 /* Read fussy-fzf-native-highlight via symbol-value and resolve to a cap.
    Returns:
      0    — no highlighting (nil, negative, unreadable, or zero).
@@ -1175,6 +1200,9 @@ emacs_value fzf_native_score_all(emacs_env *env,
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  bool           normalize = resolve_fzf_native_normalize(env);
+  bool           forward;
+  if (!resolve_fzf_native_forward(env, &forward)) goto err;
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto err;
 
@@ -1191,7 +1219,8 @@ emacs_value fzf_native_score_all(emacs_env *env,
           (int)filter_only_mode, fo_min_pool, fo_max_len,
           fo_logic_and ? "and" : "or", query_char_len, n);
 
-  fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+  fzf_pattern_t *pattern = fzf_parse_pattern_with_direction(
+      case_mode, normalize, query.b, fuzzy, forward);
   if (!pattern) {
     async_signal_error(
         env, "fzf-native: matcher could not allocate parsed query");
@@ -1286,7 +1315,8 @@ err_join_threads:
   emacs_value    hl_hook    = Qnil;
   HlScratch      hl_scratch = { 0 };
   if (hl_cap > 0) {
-    hl_pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+    hl_pattern = fzf_parse_pattern_with_direction(
+        case_mode, normalize, query.b, fuzzy, forward);
     if (hl_pattern) hl_slab = fzf_make_default_slab();
     if (hl_slab && !fzf_slab_set_score_scheme(hl_slab, score_scheme)) {
       fzf_free_slab(hl_slab);
@@ -1443,9 +1473,13 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
   if (!clear_only) {
     fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
     bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+    bool           normalize = resolve_fzf_native_normalize(env);
+    bool           forward;
+    if (!resolve_fzf_native_forward(env, &forward)) goto done;
     fzf_score_scheme_t score_scheme;
     if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto done;
-    pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+    pattern = fzf_parse_pattern_with_direction(
+        case_mode, normalize, query.b, fuzzy, forward);
     if (!pattern) {
       async_signal_error(
           env, "fzf-native: matcher could not allocate parsed query");
@@ -1573,9 +1607,13 @@ emacs_value fzf_native_highlight_one(emacs_env *env,
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  bool           normalize = resolve_fzf_native_normalize(env);
+  bool           forward;
+  if (!resolve_fzf_native_forward(env, &forward)) goto done;
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto done;
-  pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+  pattern = fzf_parse_pattern_with_direction(
+      case_mode, normalize, query.b, fuzzy, forward);
   if (!pattern) {
     async_signal_error(
         env, "fzf-native: matcher could not allocate parsed query");
@@ -1661,17 +1699,16 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
 
   fzf_log("fzf_native_score: str='%.*s' query='%.*s'\n", (int)str.len, str.b, (int)query.len, query.b);
 
-  /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
-   * normalize bool     : Always set to false because its not implemented yet.
-   *                      This is reserved for future use
-   * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
-   * fuzzy bool         : Enable or disable fuzzy matching
-   */
+  /* Matching settings are snapshots of the dynamic Elisp options. */
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  bool           normalize = resolve_fzf_native_normalize(env);
+  bool           forward;
+  if (!resolve_fzf_native_forward(env, &forward)) goto err;
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto err;
-  pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+  pattern = fzf_parse_pattern_with_direction(
+      case_mode, normalize, query.b, fuzzy, forward);
   if (!pattern) {
     async_signal_error(
         env, "fzf-native: matcher could not allocate parsed query");
@@ -2259,6 +2296,8 @@ typedef struct CacheEntry {
   size_t          matched_count;
   fzf_case_types  case_mode;
   bool            fuzzy;
+  bool            normalize;
+  bool            forward;
   fzf_score_scheme_t score_scheme;
   bool            filter_only;
   SharedIdx      *m_idx;
@@ -2482,11 +2521,13 @@ static bool subsumes_pattern(const fzf_pattern_t *p_prime,
    strdup first and free after — the returned pattern is self-contained. */
 static fzf_pattern_t *parse_query_for_cache(const char *query,
                                             fzf_case_types case_mode,
-                                            bool fuzzy) {
+                                            bool fuzzy, bool normalize,
+                                            bool forward) {
   if (!query || !*query) return NULL;
   char *dup = strdup(query);
   if (!dup) return NULL;
-  fzf_pattern_t *p = fzf_parse_pattern(case_mode, false, dup, fuzzy);
+  fzf_pattern_t *p = fzf_parse_pattern_with_direction(
+      case_mode, normalize, dup, fuzzy, forward);
   free(dup);
   return p;
 }
@@ -2497,10 +2538,11 @@ static fzf_pattern_t *parse_query_for_cache(const char *query,
    authoritative.  Caller holds c->mu. */
 static CacheEntry *cache_find_locked_for_scheme(
     Cache *c, const char *query, fzf_case_types case_mode, bool fuzzy,
-    fzf_score_scheme_t score_scheme) {
+    bool normalize, bool forward, fzf_score_scheme_t score_scheme) {
   for (CacheEntry *e = c->head; e; e = e->next)
     if (strcmp(e->query, query) == 0 &&
         e->case_mode == case_mode && e->fuzzy == fuzzy &&
+        e->normalize == normalize && e->forward == forward &&
         e->score_scheme == score_scheme)
       return e;
   return NULL;
@@ -2522,14 +2564,15 @@ static bool cache_entry_covers_limit(const CacheEntry *e, size_t limit) {
    Returns true on hit, false on miss. */
 static bool cache_lookup_exact_for_request_with_scheme(
     Cache *c, const char *query,
-    fzf_case_types case_mode, bool fuzzy, fzf_score_scheme_t score_scheme,
+    fzf_case_types case_mode, bool fuzzy, bool normalize, bool forward,
+    fzf_score_scheme_t score_scheme,
     bool filter_only, size_t limit,
     ScoredStr **out_top, size_t *out_top_count,
     SharedIdx **out_m_idx, size_t *out_pool_gen,
     size_t *out_matched_count, bool *out_result_covered) {
   pthread_mutex_lock(&c->mu);
   CacheEntry *e = cache_find_locked_for_scheme(
-      c, query, case_mode, fuzzy, score_scheme);
+      c, query, case_mode, fuzzy, normalize, forward, score_scheme);
   if (!e) { pthread_mutex_unlock(&c->mu); return false; }
 
   size_t copy_count = e->top_count;
@@ -2571,11 +2614,11 @@ static bool cache_lookup_exact_for_request_with_scheme(
    public result stays visible until the retry finishes. */
 static bool cache_lookup_membership_exact(
     Cache *c, const char *query, fzf_case_types case_mode, bool fuzzy,
-    fzf_score_scheme_t score_scheme,
+    bool normalize, bool forward, fzf_score_scheme_t score_scheme,
     SharedIdx **out_m_idx, size_t *out_pool_gen) {
   pthread_mutex_lock(&c->mu);
   CacheEntry *e = cache_find_locked_for_scheme(
-      c, query, case_mode, fuzzy, score_scheme);
+      c, query, case_mode, fuzzy, normalize, forward, score_scheme);
   if (!e) {
     pthread_mutex_unlock(&c->mu);
     return false;
@@ -2605,12 +2648,14 @@ static bool cache_lookup_membership_exact(
 static bool cache_lookup_prefix_with_scheme(
                                 Cache *c, const char *query,
                                 fzf_case_types case_mode, bool fuzzy,
+                                bool normalize, bool forward,
                                 fzf_score_scheme_t score_scheme,
                                 ScoredStr **out_top, size_t *out_top_count,
                                 SharedIdx **out_m_idx, size_t *out_pool_gen) {
   if (strchr(query, '|')) return false;   /* fast reject */
 
-  fzf_pattern_t *p_query = parse_query_for_cache(query, case_mode, fuzzy);
+  fzf_pattern_t *p_query = parse_query_for_cache(
+      query, case_mode, fuzzy, normalize, forward);
   /* If parse failed and query isn't empty, fall back to byte-prefix only.
      Empty query has p_query == NULL but byte-prefix subsumes("", anything)
      also returns true so the loop still works. */
@@ -2621,6 +2666,7 @@ static bool cache_lookup_prefix_with_scheme(
   size_t best_len   = 0;
   for (CacheEntry *e = c->head; e; e = e->next) {
     if (e->case_mode != case_mode || e->fuzzy != fuzzy ||
+        e->normalize != normalize || e->forward != forward ||
         e->score_scheme != score_scheme) continue;
     if (!e->m_idx) continue;
     if (strcmp(e->query, query) == 0) continue;
@@ -2670,7 +2716,8 @@ static bool cache_lookup_prefix_with_scheme(
    as a prefix-refinement source. */
 static void cache_insert_shared_for_request_abortable(
     Cache *c, const char *query, size_t pool_gen,
-    fzf_case_types case_mode, bool fuzzy, fzf_score_scheme_t score_scheme,
+    fzf_case_types case_mode, bool fuzzy, bool normalize, bool forward,
+    fzf_score_scheme_t score_scheme,
     bool filter_only,
     const ScoredStr *top, size_t top_count, size_t matched_count,
     SharedIdx *membership,
@@ -2699,7 +2746,8 @@ static void cache_insert_shared_for_request_abortable(
   /* Parse once on insert so cache_lookup_prefix doesn't pay parse cost on
      every iteration of its scan loop.  NULL is fine — entries with NULL
      parsed only participate via the byte-prefix subsumption fallback. */
-  fzf_pattern_t *parsed = parse_query_for_cache(query, case_mode, fuzzy);
+  fzf_pattern_t *parsed = parse_query_for_cache(
+      query, case_mode, fuzzy, normalize, forward);
 
   if (!q_dup || async_stop_requested(stop)) {
     free(q_dup);
@@ -2723,7 +2771,7 @@ static void cache_insert_shared_for_request_abortable(
     return;
   }
   CacheEntry *e = cache_find_locked_for_scheme(
-      c, query, case_mode, fuzzy, score_scheme);
+      c, query, case_mode, fuzzy, normalize, forward, score_scheme);
   if (e) {
     /* Update existing entry: swap fields, release old refs after unlock. */
     char *old_q = e->query;
@@ -2737,6 +2785,8 @@ static void cache_insert_shared_for_request_abortable(
     e->matched_count = matched_count;
     e->case_mode = case_mode;
     e->fuzzy = fuzzy;
+    e->normalize = normalize;
+    e->forward = forward;
     e->score_scheme = score_scheme;
     e->filter_only = filter_only;
     e->m_idx     = sidx;
@@ -2782,6 +2832,8 @@ static void cache_insert_shared_for_request_abortable(
   ne->matched_count = matched_count;
   ne->case_mode = case_mode;
   ne->fuzzy = fuzzy;
+  ne->normalize = normalize;
+  ne->forward = forward;
   ne->score_scheme = score_scheme;
   ne->filter_only = filter_only;
   ne->m_idx     = sidx;
@@ -2810,7 +2862,8 @@ static void cache_insert_shared_for_request_abortable(
 
 static void cache_insert_for_request_abortable(
     Cache *c, const char *query, size_t pool_gen,
-    fzf_case_types case_mode, bool fuzzy, fzf_score_scheme_t score_scheme,
+    fzf_case_types case_mode, bool fuzzy, bool normalize, bool forward,
+    fzf_score_scheme_t score_scheme,
     bool filter_only,
     const ScoredStr *top, size_t top_count, size_t matched_count,
     const uint32_t *m_idx_src, size_t m_idx_count,
@@ -2820,19 +2873,22 @@ static void cache_insert_for_request_abortable(
   SharedIdx *membership = !strchr(query, '|') && membership_complete
       ? shared_idx_alloc_abortable(m_idx_src, m_idx_count, stop) : NULL;
   cache_insert_shared_for_request_abortable(
-      c, query, pool_gen, case_mode, fuzzy, score_scheme, filter_only,
+      c, query, pool_gen, case_mode, fuzzy, normalize, forward,
+      score_scheme, filter_only,
       top, top_count, matched_count, membership, stop);
   shared_idx_release(membership);
 }
 
 static void cache_insert_for_request_with_scheme(
     Cache *c, const char *query, size_t pool_gen,
-    fzf_case_types case_mode, bool fuzzy, fzf_score_scheme_t score_scheme,
+    fzf_case_types case_mode, bool fuzzy, bool normalize, bool forward,
+    fzf_score_scheme_t score_scheme,
     bool filter_only,
     const ScoredStr *top, size_t top_count, size_t matched_count,
     const uint32_t *m_idx_src, size_t m_idx_count) {
   cache_insert_for_request_abortable(
-      c, query, pool_gen, case_mode, fuzzy, score_scheme, filter_only,
+      c, query, pool_gen, case_mode, fuzzy, normalize, forward, score_scheme,
+      filter_only,
       top, top_count, matched_count, m_idx_src, m_idx_count, NULL);
 }
 
@@ -2848,7 +2904,7 @@ static bool cache_lookup_exact_for_request(
     SharedIdx **out_m_idx, size_t *out_pool_gen,
     size_t *out_matched_count, bool *out_result_covered) {
   return cache_lookup_exact_for_request_with_scheme(
-      c, query, case_mode, fuzzy, FZF_SCORE_SCHEME_DEFAULT,
+      c, query, case_mode, fuzzy, false, true, FZF_SCORE_SCHEME_DEFAULT,
       filter_only, limit, out_top, out_top_count, out_m_idx, out_pool_gen,
       out_matched_count, out_result_covered);
 }
@@ -2858,7 +2914,7 @@ static bool cache_lookup_prefix(
     ScoredStr **out_top, size_t *out_top_count,
     SharedIdx **out_m_idx, size_t *out_pool_gen) {
   return cache_lookup_prefix_with_scheme(
-      c, query, case_mode, fuzzy, FZF_SCORE_SCHEME_DEFAULT,
+      c, query, case_mode, fuzzy, false, true, FZF_SCORE_SCHEME_DEFAULT,
       out_top, out_top_count, out_m_idx, out_pool_gen);
 }
 
@@ -2868,7 +2924,8 @@ static void cache_insert_for_request(
     const ScoredStr *top, size_t top_count, size_t matched_count,
     const uint32_t *m_idx_src, size_t m_idx_count) {
   cache_insert_for_request_with_scheme(
-      c, query, pool_gen, case_mode, fuzzy, FZF_SCORE_SCHEME_DEFAULT,
+      c, query, pool_gen, case_mode, fuzzy, false, true,
+      FZF_SCORE_SCHEME_DEFAULT,
       filter_only, top, top_count, matched_count, m_idx_src, m_idx_count);
 }
 
@@ -2878,7 +2935,8 @@ static bool cache_lookup_exact(Cache *c, const char *query,
   size_t matched_count = 0;
   bool covered = false;
   return cache_lookup_exact_for_request_with_scheme(
-      c, query, CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT, false, 0,
+      c, query, CaseSmart, true, false, true, FZF_SCORE_SCHEME_DEFAULT,
+      false, 0,
       out_top, out_top_count, out_m_idx, out_pool_gen,
       &matched_count, &covered);
 }
@@ -2890,7 +2948,7 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
   size_t matched_count = m_idx_count ? m_idx_count : top_count;
   cache_insert_for_request_with_scheme(
                            c, query, pool_gen, case_mode, fuzzy,
-                           FZF_SCORE_SCHEME_DEFAULT, false,
+                           false, true, FZF_SCORE_SCHEME_DEFAULT, false,
                            top, top_count, matched_count,
                            m_idx_src, m_idx_count);
 }
@@ -2915,6 +2973,8 @@ struct BatchQuery {
   fzf_pattern_t  *parsed;
   fzf_case_types  case_mode;
   bool            fuzzy;
+  bool            normalize;
+  bool            forward;
   fzf_score_scheme_t score_scheme;
   uint64_t         hash;
   BatchCacheEntry *entry_head;
@@ -2987,6 +3047,7 @@ static size_t batch_cache_hash(const BatchCache *c, const BatchQuery *query,
 static uint64_t batch_cache_query_hash(const char *query,
                                        fzf_case_types case_mode,
                                        bool fuzzy,
+                                       bool normalize, bool forward,
                                        fzf_score_scheme_t score_scheme) {
   uint64_t hash = UINT64_C(14695981039346656037);
   for (const unsigned char *p = (const unsigned char *)query; *p; p++) {
@@ -2996,6 +3057,10 @@ static uint64_t batch_cache_query_hash(const char *query,
   hash ^= (uint64_t)(unsigned)case_mode;
   hash *= UINT64_C(1099511628211);
   hash ^= fuzzy ? UINT64_C(1) : UINT64_C(0);
+  hash *= UINT64_C(1099511628211);
+  hash ^= normalize ? UINT64_C(1) : UINT64_C(0);
+  hash *= UINT64_C(1099511628211);
+  hash ^= forward ? UINT64_C(1) : UINT64_C(0);
   hash *= UINT64_C(1099511628211);
   hash ^= (uint64_t)(unsigned)score_scheme;
   hash *= UINT64_C(1099511628211);
@@ -3060,11 +3125,13 @@ static void batch_cache_query_lru_touch_locked(BatchCache *c,
 static BatchQuery *batch_cache_find_query_locked_for_scheme(
     BatchCache *c, const char *query,
     fzf_case_types case_mode, bool fuzzy,
-    fzf_score_scheme_t score_scheme, uint64_t hash) {
+    bool normalize, bool forward, fzf_score_scheme_t score_scheme,
+    uint64_t hash) {
   if (!c->query_buckets || c->query_bucket_count == 0) return NULL;
   size_t bucket = batch_cache_query_bucket(c, hash);
   for (BatchQuery *q = c->query_buckets[bucket]; q; q = q->hash_next)
     if (q->hash == hash && q->case_mode == case_mode && q->fuzzy == fuzzy &&
+        q->normalize == normalize && q->forward == forward &&
         q->score_scheme == score_scheme &&
         strcmp(q->query, query) == 0)
       return q;
@@ -3091,14 +3158,14 @@ static void batch_cache_remove_query_locked(BatchCache *c, BatchQuery *query) {
 static BatchQuery *batch_cache_acquire_query_for_scheme(
     BatchCache *c, const char *query,
     fzf_case_types case_mode, bool fuzzy,
-    fzf_score_scheme_t score_scheme) {
+    bool normalize, bool forward, fzf_score_scheme_t score_scheme) {
   if (!c->max_bytes || !c->buckets || !c->query_buckets) return NULL;
 
   uint64_t hash = batch_cache_query_hash(
-      query, case_mode, fuzzy, score_scheme);
+      query, case_mode, fuzzy, normalize, forward, score_scheme);
   pthread_mutex_lock(&c->mu);
   BatchQuery *found = batch_cache_find_query_locked_for_scheme(
-      c, query, case_mode, fuzzy, score_scheme, hash);
+      c, query, case_mode, fuzzy, normalize, forward, score_scheme, hash);
   if (found) {
     found->external_refs++;
     batch_cache_query_lru_touch_locked(c, found);
@@ -3108,7 +3175,8 @@ static BatchQuery *batch_cache_acquire_query_for_scheme(
   pthread_mutex_unlock(&c->mu);
 
   char *query_copy = strdup(query);
-  fzf_pattern_t *parsed = parse_query_for_cache(query, case_mode, fuzzy);
+  fzf_pattern_t *parsed = parse_query_for_cache(
+      query, case_mode, fuzzy, normalize, forward);
   BatchQuery *created = calloc(1, sizeof *created);
   if (!query_copy || !created) {
     free(query_copy);
@@ -3120,6 +3188,8 @@ static BatchQuery *batch_cache_acquire_query_for_scheme(
   created->parsed = parsed;
   created->case_mode = case_mode;
   created->fuzzy = fuzzy;
+  created->normalize = normalize;
+  created->forward = forward;
   created->score_scheme = score_scheme;
   created->hash = hash;
   size_t query_len = strlen(query_copy);
@@ -3137,7 +3207,7 @@ static BatchQuery *batch_cache_acquire_query_for_scheme(
 
   pthread_mutex_lock(&c->mu);
   found = batch_cache_find_query_locked_for_scheme(
-      c, query, case_mode, fuzzy, score_scheme, hash);
+      c, query, case_mode, fuzzy, normalize, forward, score_scheme, hash);
   if (found) {
     found->external_refs++;
     batch_cache_query_lru_touch_locked(c, found);
@@ -3190,20 +3260,20 @@ static size_t batch_cache_test_last_source_scan;
 static BatchQuery *batch_cache_select_source_for_scheme(
     BatchCache *c, const char *target,
     fzf_case_types case_mode, bool fuzzy,
-    fzf_score_scheme_t score_scheme) {
+    bool normalize, bool forward, fzf_score_scheme_t score_scheme) {
   if (!c->max_bytes || !c->buckets || !c->query_buckets) return NULL;
   fzf_pattern_t *target_pattern = parse_query_for_cache(
-      target, case_mode, fuzzy);
+      target, case_mode, fuzzy, normalize, forward);
   BatchQuery *best = NULL;
   size_t best_terms = 0;
   size_t best_len = 0;
   size_t inspected = 0;
   uint64_t hash = batch_cache_query_hash(
-      target, case_mode, fuzzy, score_scheme);
+      target, case_mode, fuzzy, normalize, forward, score_scheme);
 
   pthread_mutex_lock(&c->mu);
   BatchQuery *exact = batch_cache_find_query_locked_for_scheme(
-      c, target, case_mode, fuzzy, score_scheme, hash);
+      c, target, case_mode, fuzzy, normalize, forward, score_scheme, hash);
   if (exact && exact->entry_count > 0) {
     best = exact;
   }
@@ -3211,7 +3281,8 @@ static BatchQuery *batch_cache_select_source_for_scheme(
        q && inspected < c->source_scan_limit; q = q->lru_next) {
     inspected++;
     if (q->entry_count == 0 || q->case_mode != case_mode ||
-        q->fuzzy != fuzzy || q->score_scheme != score_scheme)
+        q->fuzzy != fuzzy || q->normalize != normalize ||
+        q->forward != forward || q->score_scheme != score_scheme)
       continue;
     bool safe = subsumes(q->query, target) ||
                 (target_pattern &&
@@ -3243,21 +3314,22 @@ static BatchQuery *batch_cache_find_query_locked(
     BatchCache *c, const char *query,
     fzf_case_types case_mode, bool fuzzy, uint64_t hash) {
   return batch_cache_find_query_locked_for_scheme(
-      c, query, case_mode, fuzzy, FZF_SCORE_SCHEME_DEFAULT, hash);
+      c, query, case_mode, fuzzy, false, true, FZF_SCORE_SCHEME_DEFAULT,
+      hash);
 }
 
 static BatchQuery *batch_cache_acquire_query(
     BatchCache *c, const char *query,
     fzf_case_types case_mode, bool fuzzy) {
   return batch_cache_acquire_query_for_scheme(
-      c, query, case_mode, fuzzy, FZF_SCORE_SCHEME_DEFAULT);
+      c, query, case_mode, fuzzy, false, true, FZF_SCORE_SCHEME_DEFAULT);
 }
 
 static BatchQuery *batch_cache_select_source(
     BatchCache *c, const char *target,
     fzf_case_types case_mode, bool fuzzy) {
   return batch_cache_select_source_for_scheme(
-      c, target, case_mode, fuzzy, FZF_SCORE_SCHEME_DEFAULT);
+      c, target, case_mode, fuzzy, false, true, FZF_SCORE_SCHEME_DEFAULT);
 }
 #endif
 
@@ -3623,6 +3695,8 @@ typedef struct {
   size_t           score_latest_limit;
   fzf_case_types   score_latest_case_mode;
   bool             score_latest_fuzzy;
+  bool             score_latest_normalize;
+  bool             score_latest_forward;
   fzf_score_scheme_t score_latest_scheme;
   size_t           score_latest_filter_only_length;
   bool             score_latest_filter_only_logic_and;
@@ -3636,6 +3710,8 @@ typedef struct {
   size_t           score_req_limit;
   fzf_case_types   score_req_case_mode;
   bool             score_req_fuzzy;
+  bool             score_req_normalize;
+  bool             score_req_forward;
   fzf_score_scheme_t score_req_scheme;
   /* Refinement request: when score_req_refine_idx is non-NULL the next scoring
      run scores only those candidate indices plus s->cands[refine_delta_from..count].
@@ -3657,6 +3733,8 @@ typedef struct {
   size_t           score_current_limit;
   fzf_case_types   score_current_case_mode;
   bool             score_current_fuzzy;
+  bool             score_current_normalize;
+  bool             score_current_forward;
   fzf_score_scheme_t score_current_scheme;
   size_t           score_current_filter_only_length;
   bool             score_current_filter_only_logic_and;
@@ -3671,6 +3749,8 @@ typedef struct {
   size_t           score_result_limit;
   fzf_case_types   score_result_case_mode;
   bool             score_result_fuzzy;
+  bool             score_result_normalize;
+  bool             score_result_forward;
   fzf_score_scheme_t score_result_scheme;
   bool             score_result_filter_only;
   size_t           score_result_pool_gen;
@@ -5301,6 +5381,10 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   atomic_store(&s->producer_state, AsyncProducerRunning);
   atomic_store(&s->producer_error, 0);
   atomic_store(&s->producer_exit_status, -1);
+  s->score_latest_forward = true;
+  s->score_req_forward = true;
+  s->score_current_forward = true;
+  s->score_result_forward = true;
 
   bool cancel_ready = async_make_cancel_pipe(s);
 
@@ -6021,7 +6105,8 @@ static bool async_queue_growth_retry(AsyncSession *s) {
   char *filter = NULL;
   size_t limit = 0, fo_max_len = 0;
   fzf_case_types case_mode = CaseSmart;
-  bool fuzzy = true, fo_logic_and = false;
+  bool fuzzy = true, normalize = false, forward = true;
+  bool fo_logic_and = false;
   fzf_score_scheme_t score_scheme = FZF_SCORE_SCHEME_DEFAULT;
 
   pthread_mutex_lock(&s->score_req_mu);
@@ -6037,6 +6122,8 @@ static bool async_queue_growth_retry(AsyncSession *s) {
     limit = s->score_latest_limit;
     case_mode = s->score_latest_case_mode;
     fuzzy = s->score_latest_fuzzy;
+    normalize = s->score_latest_normalize;
+    forward = s->score_latest_forward;
     score_scheme = s->score_latest_scheme;
     fo_max_len = s->score_latest_filter_only_length;
     fo_logic_and = s->score_latest_filter_only_logic_and;
@@ -6074,7 +6161,7 @@ static bool async_queue_growth_retry(AsyncSession *s) {
   SharedIdx *refine_idx = NULL;
   size_t refine_delta_from = 0;
   bool cache_hit = cache_lookup_membership_exact(
-      &s->cache, filter, case_mode, fuzzy, score_scheme,
+      &s->cache, filter, case_mode, fuzzy, normalize, forward, score_scheme,
       &refine_idx, &refine_delta_from);
   if (cache_hit && refine_delta_from > current_pool) {
     shared_idx_release(refine_idx);
@@ -6092,6 +6179,8 @@ static bool async_queue_growth_retry(AsyncSession *s) {
     s->score_req_limit = limit;
     s->score_req_case_mode = case_mode;
     s->score_req_fuzzy = fuzzy;
+    s->score_req_normalize = normalize;
+    s->score_req_forward = forward;
     s->score_req_scheme = score_scheme;
     s->score_req_refine_idx = refine_idx;
     s->score_req_refine_delta_from = refine_delta_from;
@@ -6148,6 +6237,8 @@ static void *scoring_thread_fn(void *arg) {
     size_t          limit            = s->score_req_limit;
     fzf_case_types  case_mode        = s->score_req_case_mode;
     bool            fuzzy            = s->score_req_fuzzy;
+    bool            normalize        = s->score_req_normalize;
+    bool            forward          = s->score_req_forward;
     fzf_score_scheme_t score_scheme  = s->score_req_scheme;
     SharedIdx      *refine_idx       = s->score_req_refine_idx;   /* steal */
     size_t          refine_delta_from = s->score_req_refine_delta_from;
@@ -6163,6 +6254,8 @@ static void *scoring_thread_fn(void *arg) {
     s->score_current_limit  = limit;
     s->score_current_case_mode = case_mode;
     s->score_current_fuzzy = fuzzy;
+    s->score_current_normalize = normalize;
+    s->score_current_forward = forward;
     s->score_current_scheme = score_scheme;
     s->score_current_filter_only_length = fo_max_len;
     s->score_current_filter_only_logic_and = fo_logic_and;
@@ -6223,7 +6316,8 @@ static void *scoring_thread_fn(void *arg) {
     bool incremental_growth = false;
     if (!filter_only_mode && refine_delta_from < count) {
       bool exact_growth = cache_lookup_exact_for_request_with_scheme(
-          &s->cache, filter, case_mode, fuzzy, score_scheme, false, limit,
+          &s->cache, filter, case_mode, fuzzy, normalize, forward,
+          score_scheme, false, limit,
           &growth_top, &growth_top_count, &growth_idx, &growth_pool_gen,
           &growth_matched_count, &growth_covered);
       incremental_growth = exact_growth && growth_covered && growth_idx &&
@@ -6270,10 +6364,12 @@ static void *scoring_thread_fn(void *arg) {
        full batch.  The mutable final partial batch always scans in full. */
     BatchQuery *source_query = use_refinement ? NULL :
         batch_cache_select_source_for_scheme(
-            &s->batch_cache, filter, case_mode, fuzzy, score_scheme);
+            &s->batch_cache, filter, case_mode, fuzzy, normalize, forward,
+            score_scheme);
     BatchQuery *target_query = use_refinement ? NULL :
         batch_cache_acquire_query_for_scheme(
-            &s->batch_cache, filter, case_mode, fuzzy, score_scheme);
+            &s->batch_cache, filter, case_mode, fuzzy, normalize, forward,
+            score_scheme);
     size_t old_scan_count = use_refinement && !incremental_growth
                                 ? refine_idx->count : 0;
     size_t delta_from = use_refinement ? refine_delta_from : 0;
@@ -6312,7 +6408,8 @@ static void *scoring_thread_fn(void *arg) {
       continue;
     }
     fzf_pattern_t *pattern = flen
-        ? fzf_parse_pattern(case_mode, false, pattern_query, fuzzy)
+        ? fzf_parse_pattern_with_direction(
+              case_mode, normalize, pattern_query, fuzzy, forward)
         : NULL;
     free(pattern_query);
     if (flen && !pattern) {
@@ -6794,10 +6891,11 @@ static void *scoring_thread_fn(void *arg) {
 
     /* Cache the result.  pool_gen = count (the pool size we actually scored).
        For exact producer growth, COMPLETED_MEMBERSHIP shares the immutable
-       old prefix and owns only the newly matched suffix.  The score scheme is
-       part of the semantic cache key. */
+       old prefix and owns only the newly matched suffix.  All matching
+       controls are part of the semantic cache key. */
     cache_insert_shared_for_request_abortable(
-        &s->cache, filter, count, case_mode, fuzzy, score_scheme,
+        &s->cache, filter, count, case_mode, fuzzy, normalize, forward,
+        score_scheme,
         filter_only_mode, flat, emit, matched_total,
         completed_membership, &s->score_abort);
     shared_idx_release(completed_membership);
@@ -6845,6 +6943,8 @@ static void *scoring_thread_fn(void *arg) {
       s->score_result_limit = limit;
       s->score_result_case_mode = case_mode;
       s->score_result_fuzzy = fuzzy;
+      s->score_result_normalize = normalize;
+      s->score_result_forward = forward;
       s->score_result_scheme = score_scheme;
       s->score_result_filter_only = filter_only_mode;
       s->score_result_pool_gen = count;
@@ -6895,16 +6995,20 @@ static bool async_request_matches_for_scheme(const char *stored_filter,
                                   size_t stored_limit,
                                   fzf_case_types stored_case_mode,
                                   bool stored_fuzzy,
+                                  bool stored_normalize,
+                                  bool stored_forward,
                                   fzf_score_scheme_t stored_scheme,
                                   size_t stored_fo_length,
                                   bool stored_fo_logic_and,
                                   const char *filter, size_t limit,
                                   fzf_case_types case_mode, bool fuzzy,
+                                  bool normalize, bool forward,
                                   fzf_score_scheme_t score_scheme,
                                   size_t fo_length, bool fo_logic_and) {
   return stored_filter && strcmp(stored_filter, filter) == 0 &&
          stored_limit == limit && stored_case_mode == case_mode &&
-         stored_fuzzy == fuzzy && stored_scheme == score_scheme &&
+         stored_fuzzy == fuzzy && stored_normalize == normalize &&
+         stored_forward == forward && stored_scheme == score_scheme &&
          stored_fo_length == fo_length &&
          stored_fo_logic_and == fo_logic_and;
 }
@@ -6915,6 +7019,7 @@ static bool async_request_matches_for_scheme(const char *stored_filter,
 static bool async_current_request_reusable_for_scheme(
     const AsyncSession *s, const char *filter, size_t limit,
     fzf_case_types case_mode, bool fuzzy,
+    bool normalize, bool forward,
     fzf_score_scheme_t score_scheme,
     size_t fo_length, bool fo_logic_and) {
   return s->score_req_id == 0 &&
@@ -6922,10 +7027,12 @@ static bool async_current_request_reusable_for_scheme(
          async_request_matches_for_scheme(
              s->score_current_filter, s->score_current_limit,
              s->score_current_case_mode, s->score_current_fuzzy,
+             s->score_current_normalize, s->score_current_forward,
              s->score_current_scheme,
              s->score_current_filter_only_length,
              s->score_current_filter_only_logic_and,
-             filter, limit, case_mode, fuzzy, score_scheme,
+             filter, limit, case_mode, fuzzy, normalize, forward,
+             score_scheme,
              fo_length, fo_logic_and);
 }
 
@@ -6934,7 +7041,8 @@ static bool async_current_request_reusable_for_scheme(
    entering here; FILTER ownership always transfers to this function. */
 static uint64_t async_submit_request_resolved_for_scheme(
     AsyncSession *s, char *filter, size_t filter_byte_len, size_t limit,
-    fzf_case_types case_mode, bool fuzzy, fzf_score_scheme_t score_scheme,
+    fzf_case_types case_mode, bool fuzzy, bool normalize, bool forward,
+    fzf_score_scheme_t score_scheme,
     size_t fo_max_len,
     bool fo_logic_and) {
   if (!filter) return 0;
@@ -6954,10 +7062,11 @@ static uint64_t async_submit_request_resolved_for_scheme(
   if (async_request_matches_for_scheme(
           s->score_req_filter, s->score_req_limit,
           s->score_req_case_mode, s->score_req_fuzzy,
+          s->score_req_normalize, s->score_req_forward,
           s->score_req_scheme,
           s->score_req_filter_only_length,
           s->score_req_filter_only_logic_and,
-          filter, limit, case_mode, fuzzy, score_scheme,
+          filter, limit, case_mode, fuzzy, normalize, forward, score_scheme,
           fo_max_len, fo_logic_and)) {
     uint64_t id = s->score_req_id;
     pthread_mutex_unlock(&s->score_req_mu);
@@ -6965,7 +7074,7 @@ static uint64_t async_submit_request_resolved_for_scheme(
     return id;
   }
   if (async_current_request_reusable_for_scheme(
-          s, filter, limit, case_mode, fuzzy, score_scheme,
+          s, filter, limit, case_mode, fuzzy, normalize, forward, score_scheme,
           fo_max_len, fo_logic_and)) {
     uint64_t id = s->score_current_id;
     pthread_mutex_unlock(&s->score_req_mu);
@@ -6988,6 +7097,8 @@ static uint64_t async_submit_request_resolved_for_scheme(
       s->score_result_limit == limit &&
       s->score_result_case_mode == case_mode &&
       s->score_result_fuzzy == fuzzy &&
+      s->score_result_normalize == normalize &&
+      s->score_result_forward == forward &&
       s->score_result_scheme == score_scheme &&
       s->score_result_filter_only == requested_filter_only &&
       s->score_result_pool_gen == current_pool &&
@@ -7012,7 +7123,7 @@ static uint64_t async_submit_request_resolved_for_scheme(
   bool cached_result_covered = false;
 
   bool exact_hit = cache_lookup_exact_for_request_with_scheme(
-      &s->cache, filter, case_mode, fuzzy, score_scheme,
+      &s->cache, filter, case_mode, fuzzy, normalize, forward, score_scheme,
       requested_filter_only, limit,
       &cached_top, &cached_count,
       &cached_m_idx, &cached_pool_gen,
@@ -7021,6 +7132,7 @@ static uint64_t async_submit_request_resolved_for_scheme(
   if (!exact_hit)
     prefix_hit = cache_lookup_prefix_with_scheme(
                                      &s->cache, filter, case_mode, fuzzy,
+                                     normalize, forward,
                                      score_scheme,
                                      &cached_top, &cached_count,
                                      &cached_m_idx, &cached_pool_gen);
@@ -7043,6 +7155,8 @@ static uint64_t async_submit_request_resolved_for_scheme(
   s->score_latest_limit = limit;
   s->score_latest_case_mode = case_mode;
   s->score_latest_fuzzy = fuzzy;
+  s->score_latest_normalize = normalize;
+  s->score_latest_forward = forward;
   s->score_latest_scheme = score_scheme;
   s->score_latest_filter_only_length = fo_max_len;
   s->score_latest_filter_only_logic_and = fo_logic_and;
@@ -7052,10 +7166,11 @@ static uint64_t async_submit_request_resolved_for_scheme(
       !async_request_matches_for_scheme(
           s->score_current_filter, s->score_current_limit,
           s->score_current_case_mode, s->score_current_fuzzy,
+          s->score_current_normalize, s->score_current_forward,
           s->score_current_scheme,
           s->score_current_filter_only_length,
           s->score_current_filter_only_logic_and,
-          filter, limit, case_mode, fuzzy, score_scheme,
+          filter, limit, case_mode, fuzzy, normalize, forward, score_scheme,
           fo_max_len, fo_logic_and);
   if (current_changed)
     atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
@@ -7072,6 +7187,8 @@ static uint64_t async_submit_request_resolved_for_scheme(
     s->score_req_limit             = limit;
     s->score_req_case_mode         = case_mode;
     s->score_req_fuzzy             = fuzzy;
+    s->score_req_normalize         = normalize;
+    s->score_req_forward           = forward;
     s->score_req_scheme            = score_scheme;
     s->score_req_refine_idx        = cached_m_idx;
     s->score_req_refine_delta_from = cached_pool_gen;
@@ -7100,6 +7217,8 @@ static uint64_t async_submit_request_resolved_for_scheme(
     s->score_result_limit = limit;
     s->score_result_case_mode = case_mode;
     s->score_result_fuzzy = fuzzy;
+    s->score_result_normalize = normalize;
+    s->score_result_forward = forward;
     s->score_result_scheme = score_scheme;
     s->score_result_filter_only = requested_filter_only;
     s->score_result_pool_gen = current_pool;
@@ -7151,8 +7270,10 @@ static bool async_request_matches(
     size_t fo_length, bool fo_logic_and) {
   return async_request_matches_for_scheme(
       stored_filter, stored_limit, stored_case_mode, stored_fuzzy,
-      FZF_SCORE_SCHEME_DEFAULT, stored_fo_length, stored_fo_logic_and,
-      filter, limit, case_mode, fuzzy, FZF_SCORE_SCHEME_DEFAULT,
+      false, true, FZF_SCORE_SCHEME_DEFAULT,
+      stored_fo_length, stored_fo_logic_and,
+      filter, limit, case_mode, fuzzy, false, true,
+      FZF_SCORE_SCHEME_DEFAULT,
       fo_length, fo_logic_and);
 }
 
@@ -7161,7 +7282,8 @@ static bool async_current_request_reusable(
     fzf_case_types case_mode, bool fuzzy,
     size_t fo_length, bool fo_logic_and) {
   return async_current_request_reusable_for_scheme(
-      s, filter, limit, case_mode, fuzzy, FZF_SCORE_SCHEME_DEFAULT,
+      s, filter, limit, case_mode, fuzzy, false, true,
+      FZF_SCORE_SCHEME_DEFAULT,
       fo_length, fo_logic_and);
 }
 
@@ -7171,7 +7293,7 @@ static uint64_t async_submit_request_resolved(
     bool fo_logic_and) {
   return async_submit_request_resolved_for_scheme(
       s, filter, filter_byte_len, limit, case_mode, fuzzy,
-      FZF_SCORE_SCHEME_DEFAULT, fo_max_len, fo_logic_and);
+      false, true, FZF_SCORE_SCHEME_DEFAULT, fo_max_len, fo_logic_and);
 }
 #endif
 
@@ -7197,6 +7319,12 @@ static uint64_t async_submit_request(emacs_env *env, AsyncSession *s,
   }
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool fuzzy = resolve_fzf_native_fuzzy(env);
+  bool normalize = resolve_fzf_native_normalize(env);
+  bool forward;
+  if (!resolve_fzf_native_forward(env, &forward)) {
+    free(filter);
+    return 0;
+  }
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) {
     free(filter);
@@ -7214,8 +7342,8 @@ static uint64_t async_submit_request(emacs_env *env, AsyncSession *s,
     return 0;
   }
   return async_submit_request_resolved_for_scheme(
-      s, filter, filter_byte_len, limit, case_mode, fuzzy, score_scheme,
-      fo_max_len, fo_logic_and);
+      s, filter, filter_byte_len, limit, case_mode, fuzzy, normalize, forward,
+      score_scheme, fo_max_len, fo_logic_and);
 }
 
 #ifdef FZF_NATIVE_CTEST
@@ -7234,6 +7362,7 @@ static ScoredStr *async_copy_public_result_with_scheme(
     size_t *out_count, AsyncResultObservation *out_result,
     char **out_filter, size_t *out_limit,
     fzf_case_types *out_case_mode, bool *out_fuzzy,
+    bool *out_normalize, bool *out_forward,
     fzf_score_scheme_t *out_score_scheme,
     bool *out_filter_only,
     uint64_t *out_snapshot_generation,
@@ -7285,6 +7414,8 @@ static ScoredStr *async_copy_public_result_with_scheme(
   *out_limit = s->score_result_limit;
   *out_case_mode = s->score_result_case_mode;
   *out_fuzzy = s->score_result_fuzzy;
+  *out_normalize = s->score_result_normalize;
+  *out_forward = s->score_result_forward;
   *out_score_scheme = s->score_result_scheme;
   *out_filter_only = s->score_result_filter_only;
   *out_snapshot_generation = s->score_snapshot_generation;
@@ -7313,9 +7444,11 @@ static ScoredStr *async_copy_public_result(
     size_t *out_filtered, size_t *out_total,
     bool *out_allocation_failed) {
   fzf_score_scheme_t ignored_scheme = FZF_SCORE_SCHEME_DEFAULT;
+  bool ignored_normalize = false, ignored_forward = true;
   return async_copy_public_result_with_scheme(
       s, copy_candidates, out_count, out_result, out_filter, out_limit,
-      out_case_mode, out_fuzzy, &ignored_scheme, out_filter_only,
+      out_case_mode, out_fuzzy, &ignored_normalize, &ignored_forward,
+      &ignored_scheme, out_filter_only,
       out_snapshot_generation, out_progress_completed, out_progress_total,
       out_error_id, out_error, out_filtered, out_total,
       out_allocation_failed);
@@ -7347,6 +7480,7 @@ static emacs_value async_build_candidate_list(emacs_env *env,
                                                const char *filter,
                                                fzf_case_types case_mode,
                                                bool fuzzy,
+                                               bool normalize, bool forward,
                                                fzf_score_scheme_t score_scheme) {
   size_t hl_cap = 0;
   fzf_pattern_t *hl_pattern = NULL;
@@ -7370,7 +7504,8 @@ static emacs_value async_build_candidate_list(emacs_env *env,
   if (hl_cap > 0) {
     char *mutable_filter = strdup(filter);
     if (mutable_filter) {
-      hl_pattern = fzf_parse_pattern(case_mode, false, mutable_filter, fuzzy);
+      hl_pattern = fzf_parse_pattern_with_direction(
+          case_mode, normalize, mutable_filter, fuzzy, forward);
       free(mutable_filter);
     }
     hl_slab = fzf_make_default_slab();
@@ -7493,11 +7628,13 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   char *result_filter = NULL, *score_error = NULL;
   fzf_case_types result_case_mode = CaseSmart;
   fzf_score_scheme_t result_score_scheme = FZF_SCORE_SCHEME_DEFAULT;
-  bool result_fuzzy = true, result_filter_only = false;
+  bool result_fuzzy = true, result_normalize = false, result_forward = true;
+  bool result_filter_only = false;
   bool copy_failed = false;
   ScoredStr *snap = async_copy_public_result_with_scheme(
       s, true, &rcount, &result_observation, &result_filter, &result_limit,
-      &result_case_mode, &result_fuzzy, &result_score_scheme,
+      &result_case_mode, &result_fuzzy, &result_normalize, &result_forward,
+      &result_score_scheme,
       &result_filter_only,
       &snapshot_generation,
       &progress_completed, &progress_total, &error_id, &score_error,
@@ -7523,6 +7660,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
 
   emacs_value result = async_build_candidate_list(
       env, snap, rcount, result_filter, result_case_mode, result_fuzzy,
+      result_normalize, result_forward,
       result_score_scheme);
   free(result_filter);
   free(score_error);
@@ -7684,12 +7822,14 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
   char *result_filter = NULL, *score_error = NULL;
   fzf_case_types result_case_mode = CaseSmart;
   fzf_score_scheme_t result_score_scheme = FZF_SCORE_SCHEME_DEFAULT;
-  bool result_fuzzy = true, result_filter_only = false;
+  bool result_fuzzy = true, result_normalize = false, result_forward = true;
+  bool result_filter_only = false;
   bool copy_failed = false;
   ScoredStr *result_copy = async_copy_public_result_with_scheme(
       s, include_candidates, &result_count, &result_observation,
       &result_filter, &result_limit,
-      &result_case_mode, &result_fuzzy, &result_score_scheme,
+      &result_case_mode, &result_fuzzy, &result_normalize, &result_forward,
+      &result_score_scheme,
       &result_filter_only,
       &snapshot_generation,
       &progress_completed, &progress_total, &error_id, &score_error,
@@ -7753,7 +7893,8 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
   if (include_candidates)
     candidates = async_build_candidate_list(
         env, result_copy, result_count, result_filter,
-        result_case_mode, result_fuzzy, result_score_scheme);
+        result_case_mode, result_fuzzy, result_normalize, result_forward,
+        result_score_scheme);
 
   emacs_value plist = Qnil;
   plist = async_plist_put(
@@ -7823,6 +7964,11 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
                           result_filter_only ? Qt : Qnil);
   plist = async_plist_put(env, plist, ":fuzzy",
                           result_fuzzy ? Qt : Qnil);
+  plist = async_plist_put(env, plist, ":normalize",
+                          result_normalize ? Qt : Qnil);
+  plist = async_plist_put(
+      env, plist, ":search-direction",
+      result_forward ? Qforward : Qbackward);
   plist = async_plist_put(
       env, plist, ":score-scheme",
       env->intern(env, fzf_score_scheme_name(result_score_scheme)));
@@ -8002,6 +8148,12 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool fuzzy = resolve_fzf_native_fuzzy(env);
+  bool normalize = resolve_fzf_native_normalize(env);
+  bool forward;
+  if (!resolve_fzf_native_forward(env, &forward)) {
+    free(query.b);
+    return async_session_unpin_return(s, Qnil);
+  }
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) {
     free(query.b);
@@ -8022,7 +8174,8 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
 
   pthread_mutex_lock(&s->cache.mu);
   CacheEntry *e = cache_find_locked_for_scheme(
-      &s->cache, query.b, case_mode, fuzzy, score_scheme);
+      &s->cache, query.b, case_mode, fuzzy, normalize, forward,
+      score_scheme);
   bool fresh = (e != NULL && e->pool_gen == cur_pool &&
                 e->filter_only == filter_only);
   pthread_mutex_unlock(&s->cache.mu);
@@ -8036,11 +8189,15 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
        strcmp(s->score_req_filter, query.b) == 0 &&
        s->score_req_case_mode == case_mode &&
        s->score_req_fuzzy == fuzzy &&
+       s->score_req_normalize == normalize &&
+       s->score_req_forward == forward &&
        s->score_req_scheme == score_scheme) ||
       (s->score_current_filter &&
        strcmp(s->score_current_filter, query.b) == 0 &&
        s->score_current_case_mode == case_mode &&
        s->score_current_fuzzy == fuzzy &&
+       s->score_current_normalize == normalize &&
+       s->score_current_forward == forward &&
        s->score_current_scheme == score_scheme);
   pthread_mutex_unlock(&s->score_req_mu);
   if (same_query_in_flight) fresh = false;
@@ -8160,6 +8317,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qsym_score_scheme          = env->make_global_ref(env, env->intern(env, "fzf-native-score-scheme"));
   Qsym_case_mode            = env->make_global_ref(env, env->intern(env, "fzf-native-case-mode"));
   Qsym_fuzzy                = env->make_global_ref(env, env->intern(env, "fzf-native-fuzzy"));
+  Qsym_normalize            = env->make_global_ref(env, env->intern(env, "fzf-native-normalize"));
+  Qsym_search_direction     = env->make_global_ref(env, env->intern(env, "fzf-native-search-direction"));
   Qsym_batch_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-batch-highlight"));
   Qsym_async_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-async-highlight"));
   Qsym_max_line_length      = env->make_global_ref(env, env->intern(env, "fzf-native-max-line-length"));
@@ -8186,6 +8345,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qhistory = env->make_global_ref(env, env->intern(env, "history"));
   Qignore  = env->make_global_ref(env, env->intern(env, "ignore"));
   Qrespect = env->make_global_ref(env, env->intern(env, "respect"));
+  Qforward = env->make_global_ref(env, env->intern(env, "forward"));
+  Qbackward = env->make_global_ref(env, env->intern(env, "backward"));
   Qstringp = env->make_global_ref(env, env->intern(env, "stringp"));
   Qwrong_type_argument = env->make_global_ref(env, env->intern(env, "wrong-type-argument"));
   Qerror   = env->make_global_ref(env, env->intern(env, "error"));
