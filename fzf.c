@@ -782,48 +782,48 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
 /* UTF-8 helper functions */
 
 // UTF-8 aware character comparison
-static bool utf8_char_equal(utf8proc_int32_t cp1, utf8proc_int32_t cp2, 
+static bool utf8_char_equal(utf8proc_int32_t cp1, utf8proc_int32_t cp2,
                            bool case_sensitive, bool normalize) {
   if (normalize) {
     // Apply NFC normalization
     utf8proc_uint8_t buffer1[8], buffer2[8];
     utf8proc_ssize_t len1 = utf8proc_encode_char(cp1, buffer1);
     utf8proc_ssize_t len2 = utf8proc_encode_char(cp2, buffer2);
-    
+
     if (len1 > 0 && len2 > 0) {
       // Null-terminate the buffers for utf8proc_NFC
       buffer1[len1] = 0;
       buffer2[len2] = 0;
-      
+
       utf8proc_uint8_t *norm1 = utf8proc_NFC(buffer1);
       utf8proc_uint8_t *norm2 = utf8proc_NFC(buffer2);
-      
+
       if (norm1 && norm2) {
         utf8proc_int32_t norm_cp1, norm_cp2;
         utf8proc_iterate(norm1, -1, &norm_cp1);
         utf8proc_iterate(norm2, -1, &norm_cp2);
-        
+
         if (!case_sensitive) {
           norm_cp1 = utf8proc_case_fold(norm_cp1);
           norm_cp2 = utf8proc_case_fold(norm_cp2);
         }
-        
+
         free(norm1);
         free(norm2);
         return norm_cp1 == norm_cp2;
       }
-      
+
       if (norm1) free(norm1);
       if (norm2) free(norm2);
     }
   }
-  
+
   // Fallback to simple comparison
   if (!case_sensitive) {
     cp1 = utf8proc_case_fold(cp1);
     cp2 = utf8proc_case_fold(cp2);
   }
-  
+
   return cp1 == cp2;
 }
 
