@@ -519,7 +519,7 @@ func TestNativePeerScoringSchemesMatchRawOracle(t *testing.T) {
 	}
 }
 
-func TestNativePeerKnownNormalizationGap(t *testing.T) {
+func TestNativePeerPinnedNormalizationScore(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
 		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
@@ -532,23 +532,19 @@ func TestNativePeerKnownNormalizationGap(t *testing.T) {
 	}
 
 	cases := []struct {
-		name           string
-		flags          byte
-		pattern        []byte
-		candidate      []byte
-		wantUpstream   matchResponse
-		wantNativePeer matchResponse
+		name      string
+		flags     byte
+		pattern   []byte
+		candidate []byte
+		want      matchResponse
 	}{
 		{
 			name:      "latin-normalization",
 			flags:     flagCaseSensitive | flagNormalize | flagForward,
 			pattern:   []byte("cafe"),
 			candidate: []byte("café"),
-			wantUpstream: matchResponse{
+			want: matchResponse{
 				matched: true, positionsPresent: true, start: 0, end: 4, score: 114, positions: []int64{0, 1, 2, 3},
-			},
-			wantNativePeer: matchResponse{
-				matched: false, positionsPresent: true, start: -1, end: -1, score: 0, positions: []int64{},
 			},
 		},
 	}
@@ -570,16 +566,72 @@ func TestNativePeerKnownNormalizationGap(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(upstream, testCase.wantUpstream) {
-				t.Fatalf("upstream gap shape changed: got %+v; want %+v", upstream, testCase.wantUpstream)
+			if !reflect.DeepEqual(upstream, testCase.want) {
+				t.Fatalf("upstream result changed: got %+v; want %+v", upstream, testCase.want)
 			}
-			if !reflect.DeepEqual(native, testCase.wantNativePeer) {
-				t.Fatalf("native gap shape changed: got %+v; want %+v", native, testCase.wantNativePeer)
+			if !reflect.DeepEqual(native, upstream) {
+				t.Fatalf("normalization result differs: native=%+v upstream=%+v", native, upstream)
 			}
 		})
 	}
 }
 
+func TestNativePeerPinnedNormalizationMembership(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name               string
+		algorithm          algorithmID
+		pattern, candidate string
+	}{
+		{"v1-accent", algorithmV1, "cafe", "café"},
+		{"v2-accent", algorithmV2, "cafe", "café"},
+		{"exact-accent", algorithmExact, "cafe", "café"},
+		{"prefix-accent", algorithmPrefix, "ecl", "éclair"},
+		{"suffix-accent", algorithmSuffix, "cafE", "cafÉ"},
+		{"equal-fullwidth", algorithmEqual, "FZF", "ＦＺＦ"},
+		{"exact-turned", algorithmExact, "a", "ɐ"},
+		{"exact-sharp-s", algorithmExact, "s", "ß"},
+		{"exact-vietnamese-a", algorithmExact, "A", "Ấ"},
+		{"exact-vietnamese-o", algorithmExact, "O", "Ờ"},
+		{"exact-vietnamese-u", algorithmExact, "u", "ự"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := matchRequest{
+				algorithm: testCase.algorithm,
+				scheme:    schemeDefault,
+				flags:     flagCaseSensitive | flagNormalize | flagForward,
+				pattern:   []byte(testCase.pattern),
+				candidate: []byte(testCase.candidate),
+			}
+			upstream, err := oracle.match(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			native, _, err := decodeMatchResponse(peer.exchange(t,
+				matchRequestPayload(request.algorithm, request.scheme, request.flags,
+					request.pattern, request.candidate)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !upstream.matched || native.matched != upstream.matched ||
+				native.start != upstream.start || native.end != upstream.end {
+				t.Fatalf("normalization range differs: native=%+v upstream=%+v",
+					native, upstream)
+			}
+		})
+	}
+}
 func TestNativePeerKnownContiguousResultGaps(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
@@ -871,6 +923,9 @@ func rawMatrixRequest(seed, serial uint64) matchRequest {
 	if state.next()%2 != 0 {
 		request.flags |= flagCaseSensitive
 	}
+	if state.next()%4 == 0 {
+		request.flags |= flagNormalize
+	}
 	if serial%5000 == 1 {
 		length := [...]int{999, 1000, 1001}[(serial/5000)%3]
 		request.algorithm = algorithmV2
@@ -886,6 +941,19 @@ func rawMatrixRequest(seed, serial uint64) matchRequest {
 		}
 		pair := pairs[(serial/1024)%uint64(len(pairs))]
 		request.flags = flagForward
+		request.pattern = []byte(pair[0])
+		request.candidate = []byte(pair[1])
+		return request
+	}
+	if serial%1024 == 5 {
+		pairs := [...][2]string{
+			{"cafe", "café"}, {"a", "ɐ"}, {"s", "ß"},
+			{"FZF", "ＦＺＦ"}, {"O", "Ø"}, {"1", "１"},
+			{"A", "Ấ"}, {"O", "Ờ"}, {"u", "ự"},
+		}
+		pair := pairs[(serial/1024)%uint64(len(pairs))]
+		request.algorithm = algorithms[state.next()%uint64(len(algorithms))]
+		request.flags = flagCaseSensitive | flagNormalize | flagForward
 		request.pattern = []byte(pair[0])
 		request.candidate = []byte(pair[1])
 		return request
