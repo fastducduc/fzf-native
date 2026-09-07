@@ -933,6 +933,7 @@ done:
 
 static void test_pinned_fzf_backward_direction(void) {
   fzf_string_t ascii_text = {.data = "ab/ab", .size = 5};
+  fzf_string_t ascii_v2_text = {.data = "-ab-ab-", .size = 7};
   fzf_string_t ascii_pattern = {.data = "ab", .size = 2};
   fzf_string_t ascii_boundary_text = {.data = "/ab/ab/", .size = 7};
   fzf_position_t *positions = fzf_pos_array(0);
@@ -948,12 +949,12 @@ static void test_pinned_fzf_backward_direction(void) {
   CHECK(result.start == 3 && result.end == 5 && result.score > 0);
 
   result = fzf_fuzzy_match_v2_with_direction(
-      true, false, true, &ascii_text, &ascii_pattern, positions, NULL);
-  CHECK(result.start == 0 && result.end == 2 && result.score > 0);
+      true, false, true, &ascii_v2_text, &ascii_pattern, positions, NULL);
+  CHECK(result.start == 1 && result.end == 3 && result.score > 0);
   positions->size = 0;
   result = fzf_fuzzy_match_v2_with_direction(
-      true, false, false, &ascii_text, &ascii_pattern, positions, NULL);
-  CHECK(result.start == 3 && result.end == 5 && result.score > 0);
+      true, false, false, &ascii_v2_text, &ascii_pattern, positions, NULL);
+  CHECK(result.start == 4 && result.end == 6 && result.score > 0);
 
   result = fzf_exact_match_naive_with_direction(
       true, false, true, &ascii_text, &ascii_pattern, NULL, NULL);
@@ -972,6 +973,8 @@ static void test_pinned_fzf_backward_direction(void) {
   fzf_string_t utf8_text = {
       .data = "组件/组件", .size = strlen("组件/组件")};
   fzf_string_t utf8_pattern = {.data = "组件", .size = strlen("组件")};
+  fzf_string_t utf8_v2_text = {
+      .data = "-组件-组件-", .size = strlen("-组件-组件-")};
   fzf_string_t utf8_boundary_text = {
       .data = "/组件/组件/", .size = strlen("/组件/组件/")};
 
@@ -980,8 +983,8 @@ static void test_pinned_fzf_backward_direction(void) {
   CHECK(result.start == 3 && result.end == 5 && result.score > 0);
   positions->size = 0;
   result = fzf_fuzzy_match_v2_utf8_with_direction(
-      true, false, false, &utf8_text, &utf8_pattern, positions, NULL);
-  CHECK(result.start == 3 && result.end == 5 && result.score > 0);
+      true, false, false, &utf8_v2_text, &utf8_pattern, positions, NULL);
+  CHECK(result.start == 4 && result.end == 6 && result.score > 0);
   result = fzf_exact_match_utf8_with_direction(
       true, false, false, &utf8_text, &utf8_pattern, NULL, NULL);
   CHECK(result.start == 3 && result.end == 5 && result.score > 0);

@@ -1442,6 +1442,7 @@ static fzf_result_t fzf_exact_match_impl(
   int32_t best_pos = -1;
   int16_t bonus = 0;
   int16_t best_bonus = -1;
+  bool best_has_boundary_bonus = false;
   for (size_t idx = 0; idx < N; idx++) {
     char c = text->data[idx];
     if (!case_sensitive) {
@@ -1466,10 +1467,17 @@ static fzf_result_t fzf_exact_match_impl(
              (idx + 1 == N ||
               !char_class_is_word(
                   char_class_of(text->data[idx + 1], config))));
-        if (boundary_match &&
-            (bonus > best_bonus || (!forward && bonus == best_bonus))) {
-          best_pos = (int32_t)idx;
-          best_bonus = bonus;
+        if (boundary_match) {
+          bool replace = bonus > best_bonus;
+          if (!forward) {
+            replace = bonus >= BonusBoundary ||
+                      (!best_has_boundary_bonus && bonus >= best_bonus);
+          }
+          if (replace) {
+            best_pos = (int32_t)idx;
+            best_bonus = bonus;
+          }
+          if (bonus >= BonusBoundary) best_has_boundary_bonus = true;
         }
         if (boundary_match && forward && bonus >= BonusBoundary) {
           break;
@@ -1717,6 +1725,7 @@ static fzf_result_t fzf_exact_match_utf8_impl(
   int32_t best_pos = -1;
   int16_t bonus = 0;
   int16_t best_bonus = -1;
+  bool best_has_boundary_bonus = false;
   size_t match_start_byte = 0;
   size_t match_start_first_char_bytes = 0;
 
@@ -1770,10 +1779,17 @@ static fzf_result_t fzf_exact_match_utf8_impl(
                 char_class_of_codepoint(next_cp, config));
           }
         }
-        if (boundary_match &&
-            (bonus > best_bonus || (!forward && bonus == best_bonus))) {
-          best_pos = (int32_t)match_start_byte;
-          best_bonus = bonus;
+        if (boundary_match) {
+          bool replace = bonus > best_bonus;
+          if (!forward) {
+            replace = bonus >= BonusBoundary ||
+                      (!best_has_boundary_bonus && bonus >= best_bonus);
+          }
+          if (replace) {
+            best_pos = (int32_t)match_start_byte;
+            best_bonus = bonus;
+          }
+          if (bonus >= BonusBoundary) best_has_boundary_bonus = true;
         }
         if (boundary_match && forward && bonus >= BonusBoundary) {
           break;
