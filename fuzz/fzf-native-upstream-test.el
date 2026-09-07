@@ -125,12 +125,15 @@
   "Return raw matches from FZF for CASE."
   (let* ((query (fzf-native-differential-case-query case))
          (collection (fzf-native-upstream--candidate-texts case))
+         (score-scheme
+          (or (fzf-native-differential-query-score-scheme query) 'default))
          (valid-utf8
           (plist-get (fzf-native-differential-case-dimensions case)
                      :valid-utf8))
          (args
           (append
            (list "--read0" "--print0" "--no-color" "--no-multi-line"
+                 (format "--scheme=%s" score-scheme)
                  (concat "--filter="
                          (fzf-native-differential-case-rendered-query case)))
            (when (eq (fzf-native-differential-case-comparison case)
@@ -173,6 +176,12 @@
           (fzf-native-differential-query-case-mode query))
          (fzf-native-fuzzy
           (fzf-native-differential-query-fuzzy query))
+         (fzf-native-normalize
+          (fzf-native-differential-query-normalize query))
+         (fzf-native-search-direction
+          (or (fzf-native-differential-query-direction query) 'auto))
+         (fzf-native-score-scheme
+          (or (fzf-native-differential-query-score-scheme query) 'default))
          (fzf-native-batch-highlight nil)
          (fzf-native-filter-only-min-pool nil)
          (fzf-native-filter-only-length nil))
@@ -303,6 +312,12 @@ UPSTREAM-OUTPUT selects Go's malformed-byte output representation."
     (pcase key
       (:case-mode (fzf-native-differential-query-case-mode query))
       (:fuzzy (fzf-native-differential-query-fuzzy query))
+      (:normalize (fzf-native-differential-query-normalize query))
+      (:direction
+       (or (fzf-native-differential-query-direction query) 'auto))
+      (:forward (fzf-native-differential-query-forward query))
+      (:score-scheme
+       (or (fzf-native-differential-query-score-scheme query) 'default))
       (_ (plist-get dimensions key)))))
 
 (defun fzf-native-upstream--assert-pairwise-coverage (cases specifications)
@@ -334,23 +349,25 @@ Each specification has the form (KEY VALUES)."
          (left
           (cl-loop for serial below 6000
                    collect (fzf-native-upstream--generated-case
-                            seed serial 'common)))
+                            seed serial 'parity)))
          (right
           (cl-loop for serial below 6000
                    collect (fzf-native-upstream--generated-case
-                            seed serial 'common)))
+                            seed serial 'parity)))
          (replay-start 733)
          (replay-count 20)
          (replay
           (cl-loop for serial from replay-start
                    below (+ replay-start replay-count)
                    collect (fzf-native-upstream--generated-case
-                            seed serial 'common)))
+                            seed serial 'parity)))
          (long-cases
           (cl-loop for serial below 3
                    collect (fzf-native-upstream--generated-case
                             seed serial 'long)))
-         text-classes length-targets query-shapes primary-kinds rank-shapes)
+         text-classes length-targets query-shapes primary-kinds rank-shapes
+         normalize-modes direction-modes directions score-schemes
+         normalization-pairs)
     (should
      (equal (mapcar #'fzf-native-differential-case-description left)
             (mapcar #'fzf-native-differential-case-description right)))
@@ -369,6 +386,28 @@ Each specification has the form (KEY VALUES)."
         (push (plist-get dimensions :query-shape) query-shapes)
         (push (plist-get dimensions :primary-kind) primary-kinds)
         (push (plist-get dimensions :rank-shape) rank-shapes)
+        (push (fzf-native-upstream--dimension-value case :normalize)
+              normalize-modes)
+        (push (fzf-native-upstream--dimension-value case :direction)
+              direction-modes)
+        (push (fzf-native-upstream--dimension-value case :forward)
+              directions)
+        (push (fzf-native-upstream--dimension-value case :score-scheme)
+              score-schemes)
+        (push (plist-get dimensions :normalization-pair)
+              normalization-pairs)
+        (pcase (fzf-native-upstream--dimension-value case :direction)
+          ('auto
+           (should
+            (eq (fzf-native-upstream--dimension-value case :forward)
+                (not (eq (fzf-native-upstream--dimension-value
+                          case :score-scheme)
+                         'path)))))
+          ('forward
+           (should (fzf-native-upstream--dimension-value case :forward)))
+          ('backward
+           (should-not
+            (fzf-native-upstream--dimension-value case :forward))))
         (should (equal ids (number-sequence 0 (1- (length ids)))))
         (should (> (length texts)
                    (length (delete-dups (copy-sequence texts)))))
@@ -385,6 +424,15 @@ Each specification has the form (KEY VALUES)."
       (should (memq kind primary-kinds)))
     (dolist (shape '(front middle tail ambiguous))
       (should (memq shape rank-shapes)))
+    (dolist (normalize '(nil t))
+      (should (memq normalize normalize-modes)))
+    (dolist (forward '(nil t))
+      (should (memq forward directions)))
+    (dolist (direction '(auto forward backward))
+      (should (memq direction direction-modes)))
+    (dolist (scheme '(default path history))
+      (should (memq scheme score-schemes)))
+    (should (memq t normalization-pairs))
     (fzf-native-upstream--assert-pairwise-coverage
      (cl-remove-if
       (lambda (case)
@@ -396,6 +444,9 @@ Each specification has the form (KEY VALUES)."
        (:primary-kind (fuzzy exact prefix suffix equal))
        (:case-mode (smart ignore respect))
        (:fuzzy (nil t))
+       (:normalize (nil t))
+       (:direction (auto forward backward))
+       (:score-scheme (default path history))
        (:rank-shape (front middle tail ambiguous))
        (:needle-length (1 2 7 31 32 63 64))))
     (cl-loop for case in long-cases
@@ -407,6 +458,27 @@ Each specification has the form (KEY VALUES)."
                  (= expected
                     (length
                      (fzf-native-differential-term-literal primary)))))))
+
+(ert-deftest fzf-native-fuzz-upstream-malformed-ranking-uses-membership ()
+  "Do not rank byte strings that Go rewrites while decoding malformed UTF-8."
+  (let ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
+        (case
+         (fzf-native-upstream--generated-case 3735928559 9885 'parity)))
+    (skip-unless fzf)
+    (fzf-native-upstream--verify-reference fzf)
+    (should-not
+     (plist-get (fzf-native-differential-case-dimensions case) :valid-utf8))
+    (should (eq (fzf-native-differential-case-comparison case) 'membership))
+    (let ((native
+           (fzf-native-upstream--identities
+            case (fzf-native-upstream--native case)))
+          (upstream
+           (fzf-native-upstream--identities
+            case (fzf-native-upstream--fzf fzf case) t)))
+      (should
+       (equal (fzf-native-upstream--membership native)
+              (fzf-native-upstream--membership upstream)))
+      (should-not (equal native upstream)))))
 
 (ert-deftest fzf-native-fuzz-upstream-exceptions-are-narrow ()
   "Reject broad exceptions for ordinary common-profile membership."
@@ -439,6 +511,28 @@ Each specification has the form (KEY VALUES)."
                    when (eq (fzf-native-differential-case-comparison case)
                             'ranking)
                    return case))
+         (normalized
+          (cl-loop for serial below 1000
+                   for case = (fzf-native-upstream--generated-case
+                               seed serial 'parity)
+                   when (and
+                         (plist-get
+                          (fzf-native-differential-case-dimensions case)
+                          :valid-utf8)
+                         (fzf-native-differential-query-normalize
+                          (fzf-native-differential-case-query case)))
+                   return case))
+         (backward
+          (cl-loop for serial below 1000
+                   for case = (fzf-native-upstream--generated-case
+                               seed serial 'parity)
+                   when (and
+                         (plist-get
+                          (fzf-native-differential-case-dimensions case)
+                          :valid-utf8)
+                         (not (fzf-native-differential-query-forward
+                               (fzf-native-differential-case-query case))))
+                   return case))
          (malformed
           (cl-loop for serial below 1000
                    for case = (fzf-native-upstream--generated-case
@@ -458,7 +552,7 @@ Each specification has the form (KEY VALUES)."
           (fzf-native-differential-candidate-id
            (or malformed-candidate
                (car (fzf-native-differential-case-candidates malformed)))))
-         ranking-exception malformed-exception)
+         malformed-exception)
     (setf (fzf-native-differential-case-dimensions forged)
           (plist-put
            (copy-sequence
@@ -473,13 +567,13 @@ Each specification has the form (KEY VALUES)."
     (should-not
      (fzf-native-differential-classify
       ranking 'ranking '(:membership-equal nil)))
-    (setq ranking-exception
-          (fzf-native-differential-classify
-           ranking 'ranking '(:membership-equal t)))
-    (should (eq (plist-get ranking-exception :name)
-                'score-ranking-revision))
-    (should (eq (plist-get ranking-exception :disposition)
-                'parity-debt))
+    (should-not
+     (fzf-native-differential-classify
+      ranking 'ranking '(:membership-equal t)))
+    (should-not
+     (fzf-native-differential-classify normalized 'membership))
+    (should-not
+     (fzf-native-differential-classify backward 'membership))
     (setq malformed-exception
           (fzf-native-differential-classify
            malformed 'membership
@@ -516,8 +610,9 @@ Each specification has the form (KEY VALUES)."
           (make-fzf-native-differential-candidate
            :id 2 :text malformed-bytes :role 'decoy))
          (query
-          (make-fzf-native-differential-query
-           :sets nil :normalize nil :forward t))
+         (make-fzf-native-differential-query
+           :sets nil :normalize nil :direction 'auto :forward t
+           :score-scheme 'default))
          (candidate-case
           (make-fzf-native-differential-case
            :query query
@@ -564,6 +659,74 @@ Each specification has the form (KEY VALUES)."
      (fzf-native-differential-classify
       query-case 'membership '(:differing-identities (99))))))
 
+(ert-deftest fzf-native-fuzz-upstream-normalization-is-directional ()
+  "Compare parsed normalization eligibility with pinned fzf."
+  (let ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf"))))
+    (skip-unless fzf)
+    (fzf-native-upstream--verify-reference fzf)
+    (dolist
+        (spec '(("O" ("O" "Ờ" "Ổ") (0 1 2))
+                ("Ờ" ("O" "Ờ" "Ổ") (1))
+                ("Ā" ("A" "Ā" "ā") (1))))
+      (let* ((rendered-query (nth 0 spec))
+             (texts (nth 1 spec))
+             (expected (nth 2 spec))
+             (query
+              (make-fzf-native-differential-query
+               :sets nil :case-mode 'respect :fuzzy t :normalize t
+               :direction 'auto :forward t :score-scheme 'default))
+             (case
+              (make-fzf-native-differential-case
+               :seed 0 :serial 0 :profile 'parity :query query
+               :rendered-query rendered-query :comparison 'membership
+               :dimensions '(:valid-utf8 t)
+               :candidates
+               (cl-loop for text in texts
+                        for id from 0
+                        collect
+                        (make-fzf-native-differential-candidate
+                         :id id :text text :role 'normalization-probe))))
+             (native
+              (fzf-native-upstream--membership
+               (fzf-native-upstream--identities
+                case (fzf-native-upstream--native case))))
+             (upstream
+              (fzf-native-upstream--membership
+               (fzf-native-upstream--identities
+                case (fzf-native-upstream--fzf fzf case) t))))
+        (ert-info ((format "query=%S candidates=%S" rendered-query texts))
+          (should (equal native expected))
+          (should (equal upstream expected)))))))
+
+(ert-deftest fzf-native-fuzz-upstream-inverse-only-or-keeps-order ()
+  "Compare inverse-only OR order with pinned fzf for each scheme."
+  (let ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
+        (texts '("longer" "x" "path/to/value")))
+    (skip-unless fzf)
+    (fzf-native-upstream--verify-reference fzf)
+    (dolist (scheme '(default path history))
+      (let* ((query
+              (make-fzf-native-differential-query
+               :sets nil :case-mode 'respect :fuzzy t :normalize t
+               :direction 'auto :forward (not (eq scheme 'path))
+               :score-scheme scheme))
+             (case
+              (make-fzf-native-differential-case
+               :seed 0 :serial 0 :profile 'parity :query query
+               :rendered-query "!z | !q" :comparison 'ranking
+               :dimensions '(:valid-utf8 t)
+               :candidates
+               (cl-loop for text in texts
+                        for id from 0
+                        collect
+                        (make-fzf-native-differential-candidate
+                         :id id :text text :role 'inverse-only-probe))))
+             (native (fzf-native-upstream--native case))
+             (upstream (fzf-native-upstream--fzf fzf case)))
+        (ert-info ((format "scheme=%S" scheme))
+          (should (equal native texts))
+          (should (equal upstream texts)))))))
+
 (ert-deftest fzf-native-fuzz-upstream-exact-boundary-membership ()
   "Compare parsed trailing-quote boundary terms with the pinned fzf CLI."
   (let* ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
@@ -576,13 +739,10 @@ Each specification has the form (KEY VALUES)."
      for serial below 2000
      until (= checked 32)
      for case = (fzf-native-upstream--generated-case seed serial 'parity)
-     for query = (fzf-native-differential-case-query case)
      when (and
            (eq (fzf-native-differential-case-comparison case) 'membership)
            (plist-get (fzf-native-differential-case-dimensions case)
                       :valid-utf8)
-           (fzf-native-differential-query-forward query)
-           (not (fzf-native-differential-query-normalize query))
            (fzf-native-differential--case-has-kind-p case 'boundary-exact))
      do
      (let ((native
@@ -638,7 +798,15 @@ Each specification has the form (KEY VALUES)."
     (:name unicode-fold :query "σ" :case-mode ignore :fuzzy t)
     (:name unicode-case :query "Σ" :case-mode respect :fuzzy t)
     (:name unicode-cjk :query "中" :case-mode smart :fuzzy t)
-    (:name unicode-kelvin :query "K" :case-mode ignore :fuzzy t))
+    (:name unicode-kelvin :query "K" :case-mode ignore :fuzzy t)
+    (:name normalized :query "cafe" :case-mode smart :fuzzy t
+     :normalize t)
+    (:name path-auto :query "alpha" :case-mode smart :fuzzy t
+     :score-scheme path :direction auto)
+    (:name path-forward :query "alpha" :case-mode smart :fuzzy t
+     :score-scheme path :direction forward)
+    (:name default-backward :query "alpha" :case-mode smart :fuzzy t
+     :score-scheme default :direction backward))
   "Ordered query rounds for one persistent native session.")
 
 (defun fzf-native-upstream--shuffle (rng values)
@@ -668,13 +836,27 @@ Each specification has the form (KEY VALUES)."
 (defun fzf-native-upstream--session-case
     (seed serial round candidates)
   "Return an oracle case for SEED, SERIAL, ROUND, and CANDIDATES."
-  (let ((query
+  (let* ((score-scheme (or (plist-get round :score-scheme) 'default))
+         (direction (or (plist-get round :direction) 'auto))
+         (natural-forward (not (eq score-scheme 'path)))
+         (forward
+          (pcase direction
+            ('auto natural-forward)
+            ('forward t)
+            (_ nil)))
+         (normalize
+          (if (plist-member round :normalize)
+              (plist-get round :normalize)
+            t))
+         (query
          (make-fzf-native-differential-query
           :sets nil
           :case-mode (plist-get round :case-mode)
           :fuzzy (plist-get round :fuzzy)
-          :normalize nil
-          :forward t)))
+          :normalize normalize
+          :direction direction
+          :forward forward
+          :score-scheme score-scheme)))
     (make-fzf-native-differential-case
      :seed seed
      :serial serial
@@ -685,7 +867,9 @@ Each specification has the form (KEY VALUES)."
      :dimensions (list :round (plist-get round :name)
                        :valid-utf8 t
                        :producer-eof t)
-     :comparison 'membership)))
+     :comparison (if (eq forward natural-forward)
+                     'ranking
+                   'membership))))
 
 (defun fzf-native-upstream--wait-for-producer-eof (handle &optional timeout)
   "Wait for producer EOF on HANDLE for at most TIMEOUT seconds."
@@ -784,21 +968,36 @@ Each specification has the form (KEY VALUES)."
                       (query (plist-get round :query))
                       (fzf-native-case-mode (plist-get round :case-mode))
                       (fzf-native-fuzzy (plist-get round :fuzzy))
+                      (fzf-native-normalize
+                       (fzf-native-differential-query-normalize
+                        (fzf-native-differential-case-query case)))
+                      (fzf-native-search-direction
+                       (fzf-native-differential-query-direction
+                        (fzf-native-differential-case-query case)))
+                      (fzf-native-score-scheme
+                       (fzf-native-differential-query-score-scheme
+                        (fzf-native-differential-case-query case)))
                       (request-id
                        (fzf-native-async-submit handle query 0))
                       (snapshot
                        (fzf-native-upstream--wait-for-session-request
                         handle request-id))
-                      ;; Ranking remains explicit parity debt.  This lane is
-                      ;; strict about the complete set of candidate identities.
+                      (native-order
+                       (fzf-native-upstream--identities
+                        case (plist-get snapshot :candidates)))
+                      (upstream-order
+                       (fzf-native-upstream--identities
+                        case (fzf-native-upstream--fzf fzf case) t))
                       (native
-                       (fzf-native-upstream--membership
-                        (fzf-native-upstream--identities
-                         case (plist-get snapshot :candidates))))
+                       (if (eq (fzf-native-differential-case-comparison case)
+                               'ranking)
+                           native-order
+                         (fzf-native-upstream--membership native-order)))
                       (upstream
-                       (fzf-native-upstream--membership
-                        (fzf-native-upstream--identities
-                         case (fzf-native-upstream--fzf fzf case) t))))
+                       (if (eq (fzf-native-differential-case-comparison case)
+                               'ranking)
+                           upstream-order
+                         (fzf-native-upstream--membership upstream-order))))
                  (ert-info
                      ((format
                        "seed=%d serial=%d round=%d name=%S query=%S mode=%S fuzzy=%S"
@@ -827,6 +1026,16 @@ Each specification has the form (KEY VALUES)."
                                fzf-native-case-mode))
                    (should (eq (plist-get snapshot :fuzzy)
                                fzf-native-fuzzy))
+                   (should (eq (plist-get snapshot :normalize)
+                               fzf-native-normalize))
+                   (should
+                    (eq (plist-get snapshot :search-direction)
+                        (if (fzf-native-differential-query-forward
+                             (fzf-native-differential-case-query case))
+                            'forward
+                          'backward)))
+                   (should (eq (plist-get snapshot :score-scheme)
+                               fzf-native-score-scheme))
                    (should upstream)
                    (should (equal native upstream)))
                  (setq last-request-id request-id))))
