@@ -812,9 +812,13 @@ Reentry tests use this option because their callback needs one candidate."
         (should (fzf-native-test--wait-for-data handle))
       (fzf-native-async-stop handle))))
 
-(ert-deftest fzf-native-session-abi-handshake-test ()
-  "The loaded module and Elisp public contracts must agree exactly."
+(ert-deftest fzf-native-module-abi-handshake-test ()
+  "The loaded module and Elisp public ABI must agree on every platform."
   (should (= (fzf-native-abi-version) fzf-native-abi-required))
+  (should (fzf-native--verify-abi)))
+
+(ert-deftest fzf-native-session-abi-handshake-test ()
+  "The loaded POSIX session ABI must agree with the public module ABI."
   (skip-unless (fboundp 'fzf-native-session-abi-version))
   (should (= (fzf-native-session-abi-version)
              fzf-native-session-abi-required))
@@ -3345,6 +3349,46 @@ the bad byte."
     (should-error (fzf-native-score candidate "a"))
     (should-error (fzf-native-score-all (list candidate) "a"))
     (should-error (fzf-native-highlight-one candidate "a"))))
+
+(defconst fzf-native-test--artifact-smoke-tests
+  '(fzf-native-module-abi-handshake-test
+    fzf-native-session-abi-handshake-test
+    fzf-native-module-init-publication-is-reentry-safe-test
+    fzf-native-score-scheme-public-batch-test
+    fzf-native-score-scheme-invalid-value-test
+    fzf-native-normalize-public-batch-test
+    fzf-native-search-direction-public-batch-test
+    fzf-native-exact-boundary-public-batch-test
+    fzf-native-search-direction-invalid-value-test
+    fzf-native-async-preserves-empty-line-candidates-test
+    fzf-native-async-public-results-own-strings-across-reentry-test
+    fzf-native-async-candidates-pins-session-across-lisp-reentry-test
+    fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test
+    fzf-native-async-snapshot-pins-session-across-lisp-reentry-test
+    fzf-native-async-stats-pins-session-across-lisp-reentry-test
+    fzf-native-async-status-pins-session-across-lisp-reentry-test
+    fzf-native-async-submit-pins-session-across-lisp-reentry-test
+    fzf-native-async-cache-positive-quote-refinement-test
+    fzf-native-async-cache-invalid-utf8-prefix-rescans-test
+    fzf-native-async-cache-separates-score-schemes-test
+    fzf-native-async-cache-separates-normalization-test
+    fzf-native-async-cache-separates-search-direction-test
+    fzf-native-async-max-line-length-counts-characters-test
+    fzf-native-async-line-cap-streams-ansi-heavy-record-test
+    fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test
+    fzf-native-async-producer-uses-dynamic-process-environment-test
+    fzf-native-async-producer-honors-environment-removal-test
+    fzf-native-async-producer-honors-path-removal-test
+    fzf-native-async-producer-corrects-pwd-for-directory-test
+    fzf-native-async-producer-honors-pwd-removal-test
+    fzf-native-score-all-empty-string-candidate-test
+    fzf-native-utf8-case-ignore-length-changing-fold-test)
+  "Public ABI tests run against tracked and freshly built release modules.")
+
+(defun fzf-native-test-run-artifact-smoke ()
+  "Run the maintained release-module smoke suite and exit Emacs."
+  (ert-run-tests-batch-and-exit
+   (cons 'member fzf-native-test--artifact-smoke-tests)))
 
 (provide 'fzf-native-test)
 ;;; fzf-native-test.el ends here
