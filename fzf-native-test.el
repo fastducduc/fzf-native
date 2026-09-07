@@ -135,6 +135,33 @@
       (should (equal (fzf-native-score-all '(" fzf" "src/fzf") "fzf")
                      '("src/fzf" " fzf"))))))
 
+(ert-deftest fzf-native-score-scheme-ranking-parity-test ()
+  "Each score scheme applies the secondary rank keys from fzf."
+  (let ((candidates '("foo/a" "fooXXXXXXXXXXXXXXXX" "foo\\a"
+                      "foo/zz" "foo😀😀😀")))
+    (dolist
+        (case
+         '((default ("foo/a" "foo\\a" "foo/zz"
+                     "foo😀😀😀" "fooXXXXXXXXXXXXXXXX"))
+           (path ("foo😀😀😀" "fooXXXXXXXXXXXXXXXX" "foo/a"
+                  "foo\\a" "foo/zz"))
+           (history ("foo/a" "fooXXXXXXXXXXXXXXXX" "foo\\a"
+                      "foo/zz" "foo😀😀😀"))))
+      (let ((fzf-native-score-scheme (car case)))
+        (should (equal (fzf-native-score-all candidates "^foo")
+                       (cadr case))))))
+  ;; Suffix scores exercise UTF-8 rune length, saturated score ties, and the
+  ;; stable producer-index fallback in the same order as pinned fzf.
+  (let ((candidates '("zλ" "longλ" "😀λ" "bλ" "λ")))
+    (dolist
+        (case
+         '((default ("λ" "😀λ" "zλ" "bλ" "longλ"))
+           (path ("λ" "😀λ" "zλ" "bλ" "longλ"))
+           (history ("😀λ" "λ" "zλ" "longλ" "bλ"))))
+      (let ((fzf-native-score-scheme (car case)))
+        (should (equal (fzf-native-score-all candidates "λ$")
+                       (cadr case)))))))
+
 (ert-deftest fzf-native-score-scheme-invalid-value-test ()
   "An invalid scheme signals before batch or highlight work is published."
   (let ((fzf-native-score-scheme 'not-a-scheme)
@@ -1314,6 +1341,47 @@ for i in range(40): print(f\"b{i}\", flush=True)
                        before-id))))
       (fzf-native-async-stop handle))))
 
+(ert-deftest fzf-native-async-score-scheme-ranking-parity-test ()
+  "One session applies all score-scheme rank keys to the same candidates."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle
+        (fzf-native-async-start
+          (concat "printf '%s\\n' 'foo/a' 'fooXXXXXXXXXXXXXXXX' 'foo\\a' "
+                  "'foo/zz' 'foo😀😀😀' 'zλ' 'longλ' '😀λ' 'bλ' 'λ'")))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (dolist
+              (case
+               '((default ("foo/a" "foo\\a" "foo/zz"
+                           "foo😀😀😀" "fooXXXXXXXXXXXXXXXX"))
+                 (path ("foo😀😀😀" "fooXXXXXXXXXXXXXXXX" "foo/a"
+                        "foo\\a" "foo/zz"))
+                 (history ("foo/a" "fooXXXXXXXXXXXXXXXX" "foo\\a"
+                            "foo/zz" "foo😀😀😀"))))
+            (let* ((fzf-native-score-scheme (car case))
+                   (request-id (fzf-native-async-submit handle "^foo" 0))
+                   (snapshot (fzf-native-test--wait-for-request
+                              handle request-id)))
+              (should (equal (plist-get snapshot :candidates)
+                             (cadr case)))))
+          ;; A repeated suffix query must keep the pinned order after the
+          ;; first result has entered both asynchronous caches.
+          (dolist
+              (case
+               '((default ("λ" "😀λ" "zλ" "bλ" "longλ"))
+                 (path ("λ" "😀λ" "zλ" "bλ" "longλ"))
+                 (history ("😀λ" "λ" "zλ" "longλ" "bλ"))))
+            (let* ((fzf-native-score-scheme (car case))
+                   (request-id (fzf-native-async-submit handle "λ$" 0))
+                   (snapshot (fzf-native-test--wait-for-request
+                              handle request-id)))
+              (should (equal (plist-get snapshot :candidates)
+                             (cadr case))))))
+      (fzf-native-async-stop handle))))
+
 (ert-deftest fzf-native-async-bounded-top-k-crosses-coordinator-window-test ()
   "A positive limit returns exact stable top-K across multiple windows.
 The corpus exceeds 64 native batches, so this exercises the second
@@ -2121,7 +2189,7 @@ sys.stdout.buffer.write(b\"\\xe4\\xbd\\xa0\\xe9x\\n\")
           ;; three memberships but ranks only the producer-order emit window;
           ;; full scoring would select the later, higher-scoring exact
           ;; candidate "你".  Excluding it proves the one-character threshold
-          ;; fired without relying on the display order within that window.
+          ;; fired.  Pinned fzf's default length key orders the retained pair.
           (let ((deadline (+ (float-time) 5.0)))
             (while (and (not (fzf-native-async-result-fresh-p handle "你"))
                         (< (float-time) deadline))
@@ -2129,7 +2197,7 @@ sys.stdout.buffer.write(b\"\\xe4\\xbd\\xa0\\xe9x\\n\")
               (sleep-for 0.05)))
           (should (fzf-native-async-result-fresh-p handle "你"))
           (should (equal (fzf-native-async-candidates handle "你" 2)
-                         '("zzz你" "zz你"))))
+                         '("zz你" "zzz你"))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-long-line-whole-test ()
@@ -2692,8 +2760,10 @@ the uninitialised scratch."
         (progn
           (should (plist-get (fzf-native-test--wait-for-producer handle)
                              :reader-done))
-          (dolist (query '("" "!x"))
-            (let* ((request-id (fzf-native-async-submit handle query 20))
+          (dolist (case `(("" ,expected) ("!x" ,expected)))
+            (let* ((query (car case))
+                   (expected-order (cadr case))
+                   (request-id (fzf-native-async-submit handle query 20))
                    (snapshot (fzf-native-test--wait-for-request
                               handle request-id))
                    (actual
@@ -2704,7 +2774,9 @@ the uninitialised scratch."
                             (fzf-native-score-all expected query))))
               (should (eq (plist-get snapshot :state) 'complete))
               (should-not (plist-get snapshot :stale))
-              (should (equal actual expected))
+              ;; Pinned fzf keeps producer order for empty and inverse-only
+              ;; patterns because neither pattern has a sortable positive term.
+              (should (equal actual expected-order))
               (should (equal actual batch)))))
       (fzf-native-async-stop handle))))
 
