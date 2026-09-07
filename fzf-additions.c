@@ -178,16 +178,17 @@ bool fzf_has_match_bytes_preclassified(
      folding).  A non-ASCII candidate must therefore use the full scorer even
      when every query term is ASCII: Unicode lowercase mappings can cross that
      boundary (for example U+212A KELVIN SIGN -> ASCII k).  Likewise, defer if
-     any term uses a `_utf8' variant (chosen for non-ASCII query terms) or an
+     any term requests normalization, uses a `_utf8' variant, or selects an
      unrecognized algorithm.  The full scorer is authoritative for Unicode
-     case folding and `inv' negation. */
+     case folding, normalization, and `inv' negation. */
   if (!input_is_ascii)
     return fzf_get_score_bytes_preclassified(
                text, tn, false, pattern, slab) > 0;
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *set = pattern->ptr[i];
     for (size_t j = 0; j < set->size; j++)
-      if (!fzf_addn_is_ascii_algo(set->ptr[j].fn))
+      if (set->ptr[j].normalize ||
+          !fzf_addn_is_ascii_algo(set->ptr[j].fn))
         return fzf_get_score_bytes_preclassified(
                    text, tn, input_is_ascii, pattern, slab) > 0;
   }

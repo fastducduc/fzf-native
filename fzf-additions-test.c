@@ -465,11 +465,12 @@ static void check_score_positions_equivalence(const char *label,
                                               const char *query,
                                               fzf_case_types case_mode,
                                               bool fuzzy,
+                                              bool normalize,
                                               fzf_slab_config_t config,
                                               fzf_score_scheme_t scheme) {
   char *query_copy = strdup(query);
   fzf_pattern_t *pattern =
-      fzf_parse_pattern(case_mode, false, query_copy, fuzzy);
+      fzf_parse_pattern(case_mode, normalize, query_copy, fuzzy);
   fzf_slab_t *legacy_slab = fzf_make_slab(config);
   fzf_slab_t *combined_slab = fzf_make_slab(config);
   CHECK(pattern != NULL);
@@ -519,47 +520,59 @@ static void test_combined_score_positions_matches_legacy_calls(void) {
   const fzf_slab_config_t normal = {100000, 2048};
   const fzf_slab_config_t tiny = {1, 1};
   check_score_positions_equivalence(
-      "ASCII fuzzy", "src/emacs-module.c", "emc", CaseIgnore, true, normal,
-      FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "ASCII miss", "src/emacs-module.c", "xyz", CaseIgnore, true, normal,
-      FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "empty query", "src/emacs-module.c", "", CaseIgnore, true, normal,
-      FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "extended", "src/foo/emacs-module.c", "foo | bar !test .c$",
-      CaseIgnore, true, normal, FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "inverse-only keep", "src/emacs-module.c", "!test",
-      CaseIgnore, true, normal, FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "inverse-only reject", "src/emacs-test.c", "!test",
-      CaseIgnore, true, normal, FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "UTF-8 fuzzy", "路径/组件-123", "组件", CaseSmart, true, normal,
-      FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "UTF-8 case fold", "CAFÉ", "café", CaseIgnore, true, normal,
-      FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "invalid UTF-8", "ca\xe9zzQR", "QR$", CaseRespect, true, normal,
-      FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "v1 fallback", "a----------------b", "ab", CaseRespect, true, tiny,
-      FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "default suffix", "src/foo/fzf  ", "fzf$", CaseRespect, true, normal,
-      FZF_SCORE_SCHEME_DEFAULT);
-  check_score_positions_equivalence(
-      "UTF-8 suffix", "σa你 \xe2\x80\x83", "你$", CaseRespect, true,
+      "ASCII fuzzy", "src/emacs-module.c", "emc", CaseIgnore, true, false,
       normal, FZF_SCORE_SCHEME_DEFAULT);
   check_score_positions_equivalence(
-      "path scheme", ":fzf", "fzf", CaseRespect, true, normal,
+      "ASCII miss", "src/emacs-module.c", "xyz", CaseIgnore, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "empty query", "src/emacs-module.c", "", CaseIgnore, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "extended", "src/foo/emacs-module.c", "foo | bar !test .c$",
+      CaseIgnore, true, false, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "inverse-only keep", "src/emacs-module.c", "!test",
+      CaseIgnore, true, false, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "inverse-only reject", "src/emacs-test.c", "!test",
+      CaseIgnore, true, false, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "UTF-8 fuzzy", "路径/组件-123", "组件", CaseSmart, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "UTF-8 case fold", "CAFÉ", "café", CaseIgnore, true, false, normal,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "invalid UTF-8", "ca\xe9zzQR", "QR$", CaseRespect, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "v1 fallback", "a----------------b", "ab", CaseRespect, true, false,
+      tiny, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "default suffix", "src/foo/fzf  ", "fzf$", CaseRespect, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "UTF-8 suffix", "σa你 \xe2\x80\x83", "你$", CaseRespect, true,
+      false, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "path scheme", ":fzf", "fzf", CaseRespect, true, false, normal,
       FZF_SCORE_SCHEME_PATH);
   check_score_positions_equivalence(
-      "history scheme", " fzf", "fzf", CaseRespect, true, normal,
+      "history scheme", " fzf", "fzf", CaseRespect, true, false, normal,
       FZF_SCORE_SCHEME_HISTORY);
+  check_score_positions_equivalence(
+      "normalized single term", "src/café.c", "cafe", CaseRespect, true,
+      true, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "normalized compound", "src/café/module.c", "cafe module",
+      CaseRespect, true, true, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "normalized v1 fallback", "x----café", "cafe", CaseRespect, true,
+      true, tiny, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "accented query stays directional", "src/cafe.c", "café",
+      CaseRespect, true, true, normal, FZF_SCORE_SCHEME_DEFAULT);
 }
 
 static void test_slab_allocation_failure_is_reported(void) {
@@ -728,6 +741,145 @@ done:
   fzf_free_slab(slab);
 }
 
+static void check_normalized_algorithm(fzf_algo_t algorithm,
+                                       const char *candidate,
+                                       const char *query) {
+  fzf_string_t text = {.data = candidate, .size = strlen(candidate)};
+  fzf_string_t pattern = {.data = query, .size = strlen(query)};
+  fzf_position_t *positions = fzf_pos_array(0);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(positions != NULL);
+  CHECK(slab != NULL);
+  if (positions && slab) {
+    fzf_result_t plain = algorithm(
+        true, false, &text, &pattern, positions, slab);
+    positions->size = 0;
+    fzf_result_t normalized = algorithm(
+        true, true, &text, &pattern, positions, slab);
+    CHECK(plain.start < 0);
+    CHECK(normalized.start >= 0);
+    CHECK(normalized.end > normalized.start);
+  }
+  fzf_free_slab(slab);
+  fzf_free_positions(positions);
+}
+
+static void test_pinned_fzf_latin_normalization(void) {
+  check_normalized_algorithm(fzf_fuzzy_match_v1_utf8, "café", "cafe");
+  check_normalized_algorithm(fzf_fuzzy_match_v2_utf8, "café", "cafe");
+  check_normalized_algorithm(fzf_exact_match_utf8, "café", "cafe");
+  check_normalized_algorithm(fzf_prefix_match_utf8, "éclair", "ecl");
+  check_normalized_algorithm(fzf_suffix_match_utf8, "cafÉ", "cafE");
+  check_normalized_algorithm(fzf_equal_match_utf8, "ＦＺＦ", "FZF");
+  check_normalized_algorithm(fzf_exact_match_utf8, "ɐ", "a");
+  check_normalized_algorithm(fzf_exact_match_utf8, "Ấ", "A");
+  check_normalized_algorithm(fzf_exact_match_utf8, "Ờ", "O");
+  check_normalized_algorithm(fzf_exact_match_utf8, "ự", "u");
+
+  char normalized_query[] = "cafe";
+  fzf_pattern_t *normalized = fzf_parse_pattern(
+      CaseRespect, true, normalized_query, true);
+  char plain_query[] = "cafe";
+  fzf_pattern_t *plain = fzf_parse_pattern(
+      CaseRespect, false, plain_query, true);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(normalized != NULL);
+  CHECK(plain != NULL);
+  CHECK(slab != NULL);
+  if (normalized && plain && slab) {
+    CHECK(normalized->ptr[0]->ptr[0].normalize);
+    CHECK(!plain->ptr[0]->ptr[0].normalize);
+    CHECK(fzf_get_score("café", normalized, slab) > 0);
+    CHECK(fzf_has_match("café", normalized, slab));
+    CHECK(fzf_get_score("café", plain, slab) == 0);
+    CHECK(!fzf_has_match("café", plain, slab));
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(plain);
+  fzf_free_pattern(normalized);
+
+  char accented_query[] = "Ờ";
+  fzf_pattern_t *accented = fzf_parse_pattern(
+      CaseRespect, true, accented_query, true);
+  slab = fzf_make_default_slab();
+  CHECK(accented != NULL);
+  CHECK(slab != NULL);
+  if (accented && slab) {
+    CHECK(!accented->ptr[0]->ptr[0].normalize);
+    CHECK(fzf_get_score("O", accented, slab) == 0);
+    CHECK(fzf_get_score("Ờ", accented, slab) > 0);
+    CHECK(fzf_get_score("Ổ", accented, slab) == 0);
+    CHECK(!fzf_has_match("O", accented, slab));
+    CHECK(fzf_has_match("Ờ", accented, slab));
+    CHECK(!fzf_has_match("Ổ", accented, slab));
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(accented);
+
+  char uppercase_query[] = "Ā";
+  fzf_pattern_t *uppercase = fzf_parse_pattern(
+      CaseRespect, true, uppercase_query, true);
+  slab = fzf_make_default_slab();
+  CHECK(uppercase != NULL);
+  CHECK(slab != NULL);
+  if (uppercase && slab) {
+    CHECK(!uppercase->ptr[0]->ptr[0].normalize);
+    CHECK(fzf_get_score("A", uppercase, slab) == 0);
+    CHECK(fzf_get_score("Ā", uppercase, slab) > 0);
+    CHECK(fzf_get_score("ā", uppercase, slab) == 0);
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(uppercase);
+}
+
+static void test_normalized_utf8_prefilter(void) {
+  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_position_t *positions = fzf_pos_array(0);
+  CHECK(slab != NULL);
+  CHECK(positions != NULL);
+  if (!slab || !positions) goto done;
+
+  fzf_string_t miss_text = {.data = "cafzzzz", .size = 7};
+  fzf_string_t miss_pattern = {.data = "cafe", .size = 4};
+  fzf_result_t miss = fzf_fuzzy_match_v2_utf8(
+      true, true, &miss_text, &miss_pattern, positions, slab);
+  CHECK(miss.start < 0);
+  CHECK(slab->UTF8.map.byte_to_char == NULL);
+  CHECK(slab->UTF8.byte_slot_capacity == 0);
+
+  fzf_string_t hit_text = {
+      .data = "xxcaf\xC3\xA9yy",
+      .size = sizeof "xxcaf\xC3\xA9yy" - 1,
+  };
+  fzf_string_t hit_pattern = {.data = "cafe", .size = 4};
+  fzf_result_t hit = fzf_fuzzy_match_v2_utf8(
+      true, true, &hit_text, &hit_pattern, positions, slab);
+  CHECK(hit.start == 2);
+  CHECK(hit.end == 6);
+  CHECK(hit.score > 0);
+  CHECK(positions->size == 4);
+
+  utf8proc_int32_t cached_accent = 0x00e9;
+  fzf_string_t cached_pattern = {
+      .data = "\xC3\xA9",
+      .size = 2,
+      .codepoints = &cached_accent,
+      .codepoint_count = 1,
+      .codepoints_case_folded = false,
+  };
+  fzf_string_t ascii_text = {.data = "e", .size = 1};
+  positions->size = 0;
+  fzf_result_t cached = fzf_fuzzy_match_v2_utf8(
+      true, true, &ascii_text, &cached_pattern, positions, slab);
+  CHECK(cached.start == 0);
+  CHECK(cached.end == 1);
+  CHECK(cached.score > 0);
+
+done:
+  fzf_free_positions(positions);
+  fzf_free_slab(slab);
+}
+
 int main(void) {
   printf("--- fzf-additions: fzf_has_match ---\n");
   RUN(test_fuzzy_basic_match);
@@ -770,6 +922,8 @@ int main(void) {
   RUN(test_default_score_distinguishes_boundaries);
   RUN(test_score_schemes_are_slab_local);
   RUN(test_utf8_empty_suffix_trims_trailing_whitespace);
+  RUN(test_pinned_fzf_latin_normalization);
+  RUN(test_normalized_utf8_prefilter);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");
